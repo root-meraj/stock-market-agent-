@@ -13,7 +13,7 @@ def _i(k, d):
 @dataclass
 class Config:
     mode: str = os.environ.get("MODE", "paper")              # paper | live
-    exchange_id: str = os.environ.get("EXCHANGE_ID", "coindcx")  # ccxt id; swap if it differs
+    exchange_id: str = os.environ.get("EXCHANGE_ID", "binance")  # paper uses public prices; ccxt dropped coindcx, live will need a REST shim
     symbols: tuple = ("BTC/USDT", "ETH/USDT")
     timeframe: str = os.environ.get("TIMEFRAME", "4h")       # swing, not scalp
     candle_limit: int = 200
