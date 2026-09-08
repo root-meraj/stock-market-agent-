@@ -94,6 +94,7 @@ class AngelClient:
         self.smart = None
         self.jwt = self.refresh = self.feed = None
         self._scrip = None
+        self._login_date = None
 
     # --- session (daily expiry; safe to call again) ---
     def login(self):
@@ -105,6 +106,13 @@ class AngelClient:
         d = resp["data"]
         self.jwt, self.refresh = d["jwtToken"], d["refreshToken"]
         self.feed = self.smart.getfeedToken()
+        self._login_date = datetime.now().date()
+        return self
+
+    def ensure_session(self):
+        """Defensive daily refresh -- Angel tokens expire each day. Safe to call every run."""
+        if self.smart is None or self._login_date != datetime.now().date():
+            self.login()
         return self
 
     def profile_name(self):
@@ -118,8 +126,8 @@ class AngelClient:
         with open(SCRIP_PATH, encoding="utf-8") as f:
             self._scrip = json.load(f)
 
-    def token_for(self, symbol, exchange="NSE"):
-        """Numeric symbol token. Prefers the -EQ cash series for NSE equities."""
+    def scrip_row(self, symbol, exchange="NSE"):
+        """Full scrip-master row (has token + tradingsymbol). Prefers the -EQ cash series."""
         if self._scrip is None:
             self._load_scrip()
         symbol = symbol.upper()
@@ -128,7 +136,44 @@ class AngelClient:
         if not cand:
             raise KeyError(f"{symbol} not found on {exchange}")
         eq = [r for r in cand if r.get("symbol", "").upper().endswith("-EQ")]
-        return (eq or cand)[0]["token"]
+        return (eq or cand)[0]
+
+    def token_for(self, symbol, exchange="NSE"):
+        return self.scrip_row(symbol, exchange)["token"]
+
+    # --- live account / quotes / orders ---
+    def ltp(self, symbol, exchange="NSE"):
+        row = self.scrip_row(symbol, exchange)
+        resp = self.smart.ltpData(exchange, row["symbol"], row["token"])
+        return float(resp["data"]["ltp"])
+
+    def funds(self):
+        """Available cash for trading (INR)."""
+        resp = self.smart.rmsLimit()
+        return float((resp.get("data") or {}).get("availablecash") or 0.0)
+
+    def holdings(self):
+        """[{symbol, qty, ltp, value}] of current demat holdings."""
+        resp = self.smart.holding()
+        out = []
+        for h in (resp.get("data") or []):
+            qty = float(h.get("quantity") or 0)
+            ltp = float(h.get("ltp") or 0)
+            out.append({"symbol": h.get("tradingsymbol", ""), "qty": qty,
+                        "ltp": ltp, "value": qty * ltp})
+        return out
+
+    def place_order(self, symbol, side, qty, exchange="NSE",
+                    producttype="DELIVERY", ordertype="MARKET", price=0.0):
+        """Place a real order. Caller gates this behind DRY_RUN. Returns the order id."""
+        row = self.scrip_row(symbol, exchange)
+        params = {
+            "variety": "NORMAL", "tradingsymbol": row["symbol"], "symboltoken": row["token"],
+            "transactiontype": side.upper(), "exchange": exchange, "ordertype": ordertype,
+            "producttype": producttype, "duration": "DAY",
+            "price": str(price), "quantity": str(int(qty)),
+        }
+        return self.smart.placeOrder(params)
 
     # --- historical candles (chunked, cached, backoff) ---
     def fetch_ohlcv(self, symbol, interval, from_date, to_date, exchange="NSE"):
