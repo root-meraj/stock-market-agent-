@@ -3,7 +3,7 @@ from config import Config
 from db import DB
 from broker import Broker
 from risk import RiskManager
-from strategy import rsi
+from strategy import rsi, rsi_series
 
 
 class FakeEx:
@@ -22,6 +22,10 @@ def test_rsi():
     assert rsi(list(range(1, 40)), 14) > 99            # only gains
     assert rsi(list(range(40, 1, -1)), 14) < 1         # only losses
     assert rsi([5] * 40, 14) == 50.0                   # flat
+    # rsi() must equal the last point of the series it's built on (backtest relies on this)
+    closes = [100 + ((i * 37) % 17) - 8 for i in range(60)]
+    assert abs(rsi(closes, 14) - rsi_series(closes, 14)[-1]) < 1e-12
+    assert rsi_series([1, 2], 14) == [None, None]
 
 
 def test_life_meter_hysteresis():
@@ -61,6 +65,20 @@ def test_paper_round_trip():
         - proceeds * cfg.taker_fee - proceeds * cfg.tds_rate
     assert abs(b.cash() - expected) < 1e-6
     assert db.trades_since(3600) == 2
+
+
+def test_backtest_synthetic():
+    """Synthetic V-shape: RSI should hit oversold at trough, buy, then sell at peak."""
+    from backtest import run, stats, EFF_FEE, TDS_RATE
+    from dataclasses import replace
+    cfg = replace(Config(), taker_fee=EFF_FEE, tds_rate=TDS_RATE, min_net_profit=0.02)
+    # 100 down + 100 up (indices 0..199), timestamps 1h apart
+    prices = [100 - i * 0.5 for i in range(100)] + [50 + i * 0.5 for i in range(100)]
+    ohlcv = [[i * 3_600_000, p, p, p, p, 0] for i, p in enumerate(prices)]
+    broker, eq = run(cfg, {"BTC/USDT": ohlcv})
+    s = stats(eq, broker.trades, cfg.starting_capital)
+    assert s["n_trades"] >= 2, s
+    assert s["final_equity"] > cfg.starting_capital, s   # V-trade must be net-positive
 
 
 if __name__ == "__main__":
