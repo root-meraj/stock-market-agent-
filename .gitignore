@@ -5,3 +5,5 @@ agent.db
 data/
 results/
 logs/
+
+*.log

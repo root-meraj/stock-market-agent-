@@ -11,7 +11,7 @@ import csv
 import itertools
 import os
 import time
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 
 import ccxt
@@ -33,6 +33,41 @@ TDS_RATE = 0.01                           # 1% on sell notional
 
 DATA_DIR = "data"
 RESULTS_DIR = "results"
+
+
+@dataclass
+class CostModel:
+    """Per-order transaction cost as an absolute amount, plus a portfolio-level tax.
+    Two regimes so the equity survey reuses the same walk-forward machinery.
+    Costs are linear in notional here (at ~Rs 8k capital the Rs 20 brokerage cap never
+    binds -- 0.03% of a Rs 3-4k order is ~Rs 1), so buy_cost(1.0) is the per-unit rate."""
+    kind: str = "crypto"
+    fee: float = EFF_FEE                  # crypto: per-side
+    tds: float = TDS_RATE                 # crypto: per-sell
+    zero_brokerage: bool = False          # equity: many brokers are Rs 0 on delivery
+    stcg: float = 0.0                     # equity: 20% on net positive return, portfolio level
+
+    def _equity_charges(self, n, is_buy):
+        broker = 0.0 if self.zero_brokerage else min(20.0, 0.0003 * n)
+        stt = 0.001 * n                                   # 0.1% both sides
+        txn = 0.0000325 * n                               # ~0.00325%
+        sebi = 1e-6 * n                                   # Rs 10 / crore
+        stamp = 0.00015 * n if is_buy else 0.0            # 0.015% buy only
+        gst = 0.18 * (broker + txn + sebi)                # GST on brokerage+txn+sebi
+        return broker + stt + txn + sebi + stamp + gst
+
+    def buy_cost(self, notional):
+        if self.kind == "crypto":
+            return notional * self.fee
+        return self._equity_charges(notional, is_buy=True)
+
+    def sell_cost(self, notional):
+        if self.kind == "crypto":
+            return notional * (self.fee + self.tds)
+        return self._equity_charges(notional, is_buy=False)
+
+
+CRYPTO_COST = CostModel(kind="crypto")
 
 
 # --- OHLCV cache ---------------------------------------------------------
@@ -80,7 +115,8 @@ def fetch_ohlcv(symbol, tf="1h", years=2.0, exchange_id="binance"):
 # --- In-memory broker matching the surface risk+run use -------------------
 
 class BacktestBroker:
-    def __init__(self, starting_cash):
+    def __init__(self, starting_cash, cost=CRYPTO_COST):
+        self.cost = cost
         self._cash = starting_cash
         self._pos = {}
         self._prices = {}
@@ -102,27 +138,27 @@ class BacktestBroker:
         px = self._prices[symbol]
         qty = amount / px if side == "buy" else amount
         notional = qty * px
-        fee = notional * EFF_FEE
-        tds = notional * TDS_RATE if side == "sell" else 0.0
         realized = None
         if side == "buy":
+            cost = self.cost.buy_cost(notional)
             old = self._pos.get(symbol, {"qty": 0.0, "avg_price": 0.0})
             new_qty = old["qty"] + qty
             new_avg = (old["qty"] * old["avg_price"] + qty * px) / new_qty
             self._pos[symbol] = {"qty": new_qty, "avg_price": new_avg}
-            self._cash -= notional + fee
+            self._cash -= notional + cost
         else:
+            cost = self.cost.sell_cost(notional)
             old = self._pos[symbol]
-            realized = (px - old["avg_price"]) * qty - fee - tds
+            realized = (px - old["avg_price"]) * qty - cost
             new_qty = old["qty"] - qty
             if new_qty < 1e-12:
                 del self._pos[symbol]
             else:
                 self._pos[symbol]["qty"] = new_qty
-            self._cash += notional - fee - tds
+            self._cash += notional - cost
         self.trades.append({
             "ts": ts, "symbol": symbol, "side": side, "qty": qty, "price": px,
-            "fee": fee, "tds": tds, "rsi": rsi, "realized": realized,
+            "fee": cost, "tds": 0.0, "rsi": rsi, "realized": realized,
         })
 
 
@@ -148,7 +184,7 @@ class _FakeDB:
 
 # --- The replay -----------------------------------------------------------
 
-def run(cfg, ohlcv_map, signals_by_symbol=None):
+def run(cfg, ohlcv_map, signals_by_symbol=None, cost=CRYPTO_COST):
     """signals_by_symbol: {symbol: ["buy"/"sell"/None per candle index]}, precomputed by
     a strategy generator. If omitted, defaults to the RSI strategy over its own cfg params.
     Either way RiskManager gates every proposed order (sizing, TDS profit gate, life meter,
@@ -166,7 +202,7 @@ def run(cfg, ohlcv_map, signals_by_symbol=None):
             rser = rsi_series([c[4] for c in ser], cfg.rsi_period)
             signals_by_symbol[s] = [strat.signal_from_rsi(r)[0] for r in rser]
 
-    broker = BacktestBroker(cfg.starting_capital)
+    broker = BacktestBroker(cfg.starting_capital, cost=cost)
     risk = RiskManager(cfg, _FakeDB(broker.trades))
 
     equity_series = []
@@ -209,7 +245,7 @@ def run(cfg, ohlcv_map, signals_by_symbol=None):
 
 # --- Stats and outputs ----------------------------------------------------
 
-def stats(equity_series, trades, starting_cap, tf_hours=1):
+def stats(equity_series, trades, starting_cap, tf_hours=1, cost=CRYPTO_COST):
     if len(equity_series) < 2:
         return {"n_trades": 0, "final_equity": starting_cap, "total_return": 0.0,
                 "sharpe": 0.0, "max_drawdown": 0.0, "win_rate": 0.0, "avg_trade_pnl": 0.0}
@@ -221,10 +257,13 @@ def stats(equity_series, trades, starting_cap, tf_hours=1):
     mdd = float(((peak - eq) / peak).max())
     sells = [t for t in trades if t["side"] == "sell"]
     wins = [t for t in sells if (t["realized"] or 0) > 0]
+    total_return = float(eq[-1] / starting_cap - 1)
+    if cost.stcg and total_return > 0:                    # STCG on net positive return (portfolio level)
+        total_return *= (1 - cost.stcg)
     return {
         "n_trades": len(trades),
         "final_equity": float(eq[-1]),
-        "total_return": float(eq[-1] / starting_cap - 1),
+        "total_return": total_return,
         "sharpe": sharpe,
         "max_drawdown": mdd,
         "win_rate": (len(wins) / len(sells)) if sells else 0.0,
@@ -253,14 +292,17 @@ def save_outputs(broker, equity_series, s, prefix=""):
     plt.close(fig)
 
 
-def buy_and_hold(ohlcv_map):
-    """Equal-weighted B&H across the symbols; net of one buy fee, one sell fee, one TDS."""
+def buy_and_hold(ohlcv_map, cost=CRYPTO_COST):
+    """Equal-weighted B&H across the symbols; net of one buy + one sell cost, then STCG."""
+    rt = cost.buy_cost(1.0) + cost.sell_cost(1.0)          # round-trip cost as a fraction
     rets = []
     for series in ohlcv_map.values():
         if len(series) < 2:
             continue
-        gross = series[-1][4] / series[0][4] - 1
-        rets.append(gross - 2 * EFF_FEE - TDS_RATE)
+        net = (series[-1][4] / series[0][4] - 1) - rt
+        if cost.stcg and net > 0:
+            net *= (1 - cost.stcg)
+        rets.append(net)
     return sum(rets) / len(rets) if rets else 0.0
 
 
@@ -339,15 +381,15 @@ STRATEGIES = {
 }
 
 
-def _run_grid(cfg, ohlcv_map, tf_hours, gen, grid, verbose=False):
+def _run_grid(cfg, ohlcv_map, tf_hours, gen, grid, cost=CRYPTO_COST, verbose=False):
     """Run a strategy's grid on the OHLCV. Returns (results sorted by alpha desc, bh_return)."""
-    bh = buy_and_hold(ohlcv_map)
+    bh = buy_and_hold(ohlcv_map, cost)
     results = []
     for i, params in enumerate(grid):
         c = _apply(cfg, params)
         sigs = {s: gen(ser, params, c) for s, ser in ohlcv_map.items()}
-        broker, eq = run(c, ohlcv_map, sigs)
-        st = stats(eq, broker.trades, c.starting_capital, tf_hours=tf_hours)
+        broker, eq = run(c, ohlcv_map, sigs, cost=cost)
+        st = stats(eq, broker.trades, c.starting_capital, tf_hours=tf_hours, cost=cost)
         results.append({**params, "bh_return": bh, "alpha": st["total_return"] - bh, **st})
         if verbose and (i + 1) % 50 == 0:
             print(f"    {i+1}/{len(grid)}")
@@ -355,9 +397,11 @@ def _run_grid(cfg, ohlcv_map, tf_hours, gen, grid, verbose=False):
     return results, bh
 
 
-def _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid, n_windows=4, train_frac=5 / 6):
+def _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid, cost=CRYPTO_COST,
+                  n_windows=4, train_frac=5 / 6, min_train=100):
     """Generic walk-forward: n windows, train grid on first train_frac, test on the rest.
-    Returns per-window rows (params dict + train/test metrics)."""
+    Returns per-window rows (params dict + train/test metrics). min_train guards against
+    windows too short to mean anything (weekly data needs a lower floor than daily)."""
     all_ts = sorted({r[0] for series in ohlcv_map.values() for r in series})
     span = all_ts[-1] - all_ts[0]
     win_ms = span // n_windows
@@ -371,16 +415,16 @@ def _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid, n_windows=4, train_frac=5
                      for s, series in ohlcv_map.items()}
         test_map = {s: [r for r in series if split <= r[0] < w_end]
                     for s, series in ohlcv_map.items()}
-        if any(len(v) < 100 for v in train_map.values()):
+        if any(len(v) < min_train for v in train_map.values()):
             continue
-        train_res, _ = _run_grid(cfg, train_map, tf_hours, gen, grid)
+        train_res, _ = _run_grid(cfg, train_map, tf_hours, gen, grid, cost=cost)
         best = train_res[0]
         params = {k: best[k] for k in param_keys}
         c = _apply(cfg, params)
         test_sigs = {s: gen(ser, params, c) for s, ser in test_map.items()}
-        broker, eq = run(c, test_map, test_sigs)
-        test_st = stats(eq, broker.trades, c.starting_capital, tf_hours=tf_hours)
-        test_bh = buy_and_hold(test_map)
+        broker, eq = run(c, test_map, test_sigs, cost=cost)
+        test_st = stats(eq, broker.trades, c.starting_capital, tf_hours=tf_hours, cost=cost)
+        test_bh = buy_and_hold(test_map, cost)
         rows.append({
             "window": w + 1,
             "train_start": datetime.utcfromtimestamp(w_start / 1000).strftime("%Y-%m-%d"),
@@ -481,10 +525,12 @@ SURVEY_ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT"]  # LINK: mid-c
 SURVEY_TFS = ["15m", "1h", "4h", "1d"]
 
 
-def _cell(cfg, ohlcv_map, tf_hours, strategy):
+def _cell(cfg, ohlcv_map, tf_hours, strategy, cost=CRYPTO_COST,
+          n_windows=4, min_train=100, train_frac=5 / 6):
     """One (tf x asset x strategy) cell: out-of-sample walk-forward summary."""
     gen, grid = STRATEGIES[strategy]
-    rows = _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid)
+    rows = _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid, cost=cost,
+                         n_windows=n_windows, min_train=min_train, train_frac=train_frac)
     if not rows:
         return {"test_alpha": 0.0, "wf_gap": 0.0, "test_return": 0.0, "bh_return": 0.0,
                 "sharpe": 0.0, "n_trades": 0, "n_windows": 0, "param_churn": 0}
@@ -502,28 +548,31 @@ def _cell(cfg, ohlcv_map, tf_hours, strategy):
     }
 
 
-def _survey_heatmap(cells):
+def _survey_heatmap(cells, assets=None, tfs=None, path=None):
     """One asset x timeframe heatmap per strategy, colored by out-of-sample alpha."""
+    assets = assets or SURVEY_ASSETS
+    tfs = tfs or SURVEY_TFS
+    path = path or f"{RESULTS_DIR}/survey_heatmap.png"
     strategies = list(STRATEGIES)
     lut = {(c["strategy"], c["timeframe"], c["asset"]): c for c in cells}
     fig, axes = plt.subplots(1, len(strategies), figsize=(4 * len(strategies), 4), squeeze=False)
     vmax = max((abs(c["test_alpha"]) for c in cells), default=0.05) or 0.05
     for ax, sname in zip(axes[0], strategies):
         grid = np.array([[lut.get((sname, tf, a), {}).get("test_alpha", np.nan)
-                          for tf in SURVEY_TFS] for a in SURVEY_ASSETS])
+                          for tf in tfs] for a in assets])
         ax.imshow(grid, cmap="RdYlGn", vmin=-vmax, vmax=vmax, aspect="auto")
-        ax.set_xticks(range(len(SURVEY_TFS)), SURVEY_TFS)
-        ax.set_yticks(range(len(SURVEY_ASSETS)), [a.split("/")[0] for a in SURVEY_ASSETS])
+        ax.set_xticks(range(len(tfs)), tfs, rotation=30, ha="right")
+        ax.set_yticks(range(len(assets)), [a.split("/")[0] for a in assets])
         ax.set_title(sname)
-        for yi, a in enumerate(SURVEY_ASSETS):
-            for xi, tf in enumerate(SURVEY_TFS):
+        for yi, a in enumerate(assets):
+            for xi, tf in enumerate(tfs):
                 c = lut.get((sname, tf, a))
                 if c:
                     ax.text(xi, yi, f"{c['test_alpha']:+.0%}\nn{c['n_trades']}",
                             ha="center", va="center", fontsize=7)
     fig.suptitle("Out-of-sample alpha vs buy-and-hold (green=beats B&H after fees)")
     fig.tight_layout()
-    fig.savefig(f"{RESULTS_DIR}/survey_heatmap.png", dpi=100)
+    fig.savefig(path, dpi=100)
     plt.close(fig)
 
 

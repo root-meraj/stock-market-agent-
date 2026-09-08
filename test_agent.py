@@ -81,6 +81,23 @@ def test_backtest_synthetic():
     assert s["final_equity"] > cfg.starting_capital, s   # V-trade must be net-positive
 
 
+def test_cost_models():
+    """Crypto CostModel reproduces the old flat rates; equity charges are in-range + STCG works."""
+    from backtest import CostModel, EFF_FEE, TDS_RATE
+    cc = CostModel(kind="crypto")
+    assert abs(cc.buy_cost(1.0) - EFF_FEE) < 1e-12
+    assert abs(cc.sell_cost(1.0) - (EFF_FEE + TDS_RATE)) < 1e-12
+
+    eq = CostModel(kind="equity", stcg=0.20)
+    # round-trip cost for delivery equity is ~0.3% of notional
+    rt = eq.buy_cost(1.0) + eq.sell_cost(1.0)
+    assert 0.0025 < rt < 0.0035, rt
+    # stamp duty (0.015%) makes a buy cost more than a sell of the same notional
+    assert eq.buy_cost(1000.0) > eq.sell_cost(1000.0)
+    # zero-brokerage is cheaper than the Rs20/0.03% default
+    assert CostModel(kind="equity", zero_brokerage=True).buy_cost(1000.0) < eq.buy_cost(1000.0)
+
+
 def test_strategy_signals():
     """EMA crossover fires buy on golden cross / sell on death cross; Donchian on breakout."""
     from backtest import ema_signals, donchian_signals
