@@ -81,6 +81,23 @@ def test_backtest_synthetic():
     assert s["final_equity"] > cfg.starting_capital, s   # V-trade must be net-positive
 
 
+def test_strategy_signals():
+    """EMA crossover fires buy on golden cross / sell on death cross; Donchian on breakout."""
+    from backtest import ema_signals, donchian_signals
+    # flat (past warmup), then rise -> golden cross, then fall -> death cross
+    closes = [100] * 30 + [100 + 2 * i for i in range(25)] + [150 - 3 * i for i in range(30)]
+    ser = [[i, c, c, c, c, 0] for i, c in enumerate(closes)]
+    sig = ema_signals(ser, {"fast": 5, "slow": 15}, None)
+    assert "buy" in sig and "sell" in sig
+    assert sig.index("buy") < sig.index("sell")            # rise before fall
+
+    # Donchian: flat then a clean upside break of the prior 20-high
+    closes = [100] * 30 + [130]
+    ser = [[i, c, c, c, c, 0] for i, c in enumerate(closes)]
+    sig = donchian_signals(ser, {"period": 20}, None)
+    assert sig[-1] == "buy"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

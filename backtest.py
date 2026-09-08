@@ -11,7 +11,7 @@ import csv
 import itertools
 import os
 import time
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime
 
 import ccxt
@@ -148,21 +148,25 @@ class _FakeDB:
 
 # --- The replay -----------------------------------------------------------
 
-def run(cfg, ohlcv_map, rsi_by_symbol=None):
-    """rsi_by_symbol: optional {symbol: full RSI series} so a sweep computes RSI once
-    per (symbol, period) instead of every combo. Falls back to computing it here.
-    ponytail: full-history RSI, not a rolling candle_limit window like live. Wilder RSI
-    converges within ~100 candles so the seed difference is <0.5pt in the interior;
-    fine for tuning. Match live exactly only if a threshold sits right on that edge."""
+def run(cfg, ohlcv_map, signals_by_symbol=None):
+    """signals_by_symbol: {symbol: ["buy"/"sell"/None per candle index]}, precomputed by
+    a strategy generator. If omitted, defaults to the RSI strategy over its own cfg params.
+    Either way RiskManager gates every proposed order (sizing, TDS profit gate, life meter,
+    trade budget) — the strategy only proposes, risk disposes.
+    ponytail: full-history indicators, not a rolling candle_limit window like live. Wilder RSI
+    (and EMA) converge fast so the seed difference is negligible in the interior; fine for
+    tuning. Match live exactly only if a threshold sits right on that edge."""
     symbols = list(ohlcv_map.keys())
     all_ts = sorted({r[0] for series in ohlcv_map.values() for r in series})
     idx = {s: 0 for s in symbols}
-    if rsi_by_symbol is None:
-        rsi_by_symbol = {s: rsi_series([c[4] for c in ser], cfg.rsi_period)
-                         for s, ser in ohlcv_map.items()}
+    if signals_by_symbol is None:
+        strat = Strategy(cfg)
+        signals_by_symbol = {}
+        for s, ser in ohlcv_map.items():
+            rser = rsi_series([c[4] for c in ser], cfg.rsi_period)
+            signals_by_symbol[s] = [strat.signal_from_rsi(r)[0] for r in rser]
 
     broker = BacktestBroker(cfg.starting_capital)
-    strat = Strategy(cfg)
     risk = RiskManager(cfg, _FakeDB(broker.trades))
 
     equity_series = []
@@ -190,15 +194,14 @@ def run(cfg, ohlcv_map, rsi_by_symbol=None):
         for sym in symbols:
             if sym not in current:
                 continue
-            i = idx[sym] - 1
-            signal, r = strat.signal_from_rsi(rsi_by_symbol[sym][i])
+            signal = signals_by_symbol[sym][idx[sym] - 1]
             if not signal:
                 continue
             decision = risk.approve(signal, sym, equity, broker.cash(), positions, current[sym])
             if not decision:
                 continue
             side, amount = decision
-            broker.execute(sym, side, amount, ts=ts, rsi=r)
+            broker.execute(sym, side, amount, ts=ts)
             positions = broker.positions()
 
     return broker, equity_series
@@ -261,41 +264,142 @@ def buy_and_hold(ohlcv_map):
     return sum(rets) / len(rets) if rets else 0.0
 
 
-# --- Grid sweep -----------------------------------------------------------
+# --- Strategy family ------------------------------------------------------
+# Each generator returns ["buy"/"sell"/None per candle index]; RiskManager gates them all.
+# Mean-reversion (RSI) keeps the TDS profit gate; trend/breakout disable it via
+# min_net_profit=-1.0 (config-only, RiskManager untouched) so they can stop out of losers.
 
+CFG_FIELDS = {f.name for f in fields(Config)}
+
+
+def _apply(cfg, params):
+    return replace(cfg, **{k: v for k, v in params.items() if k in CFG_FIELDS})
+
+
+def _ema(values, period):
+    k = 2.0 / (period + 1)
+    out, e = [], None
+    for v in values:
+        e = v if e is None else v * k + e * (1.0 - k)
+        out.append(e)
+    return out
+
+
+def rsi_signals(series, params, cfg):
+    strat = Strategy(cfg)                         # reuse live threshold logic verbatim
+    rser = rsi_series([c[4] for c in series], cfg.rsi_period)
+    return [strat.signal_from_rsi(r)[0] for r in rser]
+
+
+def ema_signals(series, params, cfg):
+    closes = [c[4] for c in series]
+    fast, slow = _ema(closes, params["fast"]), _ema(closes, params["slow"])
+    out = [None] * len(closes)
+    for i in range(params["slow"], len(closes)):
+        if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
+            out[i] = "buy"
+        elif fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
+            out[i] = "sell"
+    return out
+
+
+def donchian_signals(series, params, cfg):
+    n = params["period"]
+    highs = [c[2] for c in series]
+    lows = [c[3] for c in series]
+    closes = [c[4] for c in series]
+    out = [None] * len(series)
+    # ponytail: O(n) window max/min per bar. Fine at these sizes; use a monotonic deque if it bites.
+    for i in range(n, len(series)):
+        if closes[i] > max(highs[i - n:i]):
+            out[i] = "buy"
+        elif closes[i] < min(lows[i - n:i]):
+            out[i] = "sell"
+    return out
+
+
+def _grid(pairs):
+    """Cartesian product of {key: [values]} -> list of param dicts."""
+    keys = list(pairs)
+    return [dict(zip(keys, combo)) for combo in itertools.product(*pairs.values())]
+
+
+# Full RSI sweep grid (the --sweep command); survey grids are smaller (pulse check, not tuning).
 GRID_BUY = [20, 25, 30, 35, 40, 45]
 GRID_SELL = [65, 70, 75, 80, 85]
 GRID_MNP = [0.01, 0.02, 0.03, 0.04, 0.05]
 GRID_PERIOD = [9, 14, 21]
 
+STRATEGIES = {
+    "rsi": (rsi_signals, _grid({"rsi_buy": [25, 35], "rsi_sell": [70, 80],
+                                "rsi_period": [14, 21], "min_net_profit": [0.01]})),
+    "ema": (ema_signals, _grid({"fast": [10, 20], "slow": [50, 100, 200],
+                                "min_net_profit": [-1.0]})),
+    "donchian": (donchian_signals, _grid({"period": [20, 40, 55], "min_net_profit": [-1.0]})),
+}
 
-def _run_grid(cfg, ohlcv_map, tf_hours, verbose=False):
-    """450-combo grid on the given OHLCV. Returns (results sorted by alpha desc, bh_return)."""
+
+def _run_grid(cfg, ohlcv_map, tf_hours, gen, grid, verbose=False):
+    """Run a strategy's grid on the OHLCV. Returns (results sorted by alpha desc, bh_return)."""
     bh = buy_and_hold(ohlcv_map)
-    # RSI depends only on period, not the buy/sell/mnp thresholds -> compute once per period.
-    rsi_cache = {(s, p): rsi_series([c[4] for c in ser], p)
-                 for s, ser in ohlcv_map.items() for p in set(GRID_PERIOD)}
-    combos = list(itertools.product(GRID_BUY, GRID_SELL, GRID_MNP, GRID_PERIOD))
     results = []
-    for i, (b, s_, mnp, p) in enumerate(combos):
-        c = replace(cfg, rsi_buy=b, rsi_sell=s_, min_net_profit=mnp, rsi_period=p)
-        rsi_by_symbol = {s: rsi_cache[(s, p)] for s in ohlcv_map}
-        broker, eq = run(c, ohlcv_map, rsi_by_symbol)
+    for i, params in enumerate(grid):
+        c = _apply(cfg, params)
+        sigs = {s: gen(ser, params, c) for s, ser in ohlcv_map.items()}
+        broker, eq = run(c, ohlcv_map, sigs)
         st = stats(eq, broker.trades, c.starting_capital, tf_hours=tf_hours)
-        results.append({
-            "rsi_buy": b, "rsi_sell": s_, "min_net_profit": mnp, "rsi_period": p,
-            "bh_return": bh, "alpha": st["total_return"] - bh, **st,
-        })
+        results.append({**params, "bh_return": bh, "alpha": st["total_return"] - bh, **st})
         if verbose and (i + 1) % 50 == 0:
-            print(f"    {i+1}/{len(combos)}")
+            print(f"    {i+1}/{len(grid)}")
     results.sort(key=lambda r: r["alpha"], reverse=True)
     return results, bh
 
 
+def _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid, n_windows=4, train_frac=5 / 6):
+    """Generic walk-forward: n windows, train grid on first train_frac, test on the rest.
+    Returns per-window rows (params dict + train/test metrics)."""
+    all_ts = sorted({r[0] for series in ohlcv_map.values() for r in series})
+    span = all_ts[-1] - all_ts[0]
+    win_ms = span // n_windows
+    param_keys = list(grid[0].keys())
+    rows = []
+    for w in range(n_windows):
+        w_start = all_ts[0] + w * win_ms
+        w_end = w_start + win_ms
+        split = w_start + int(win_ms * train_frac)
+        train_map = {s: [r for r in series if w_start <= r[0] < split]
+                     for s, series in ohlcv_map.items()}
+        test_map = {s: [r for r in series if split <= r[0] < w_end]
+                    for s, series in ohlcv_map.items()}
+        if any(len(v) < 100 for v in train_map.values()):
+            continue
+        train_res, _ = _run_grid(cfg, train_map, tf_hours, gen, grid)
+        best = train_res[0]
+        params = {k: best[k] for k in param_keys}
+        c = _apply(cfg, params)
+        test_sigs = {s: gen(ser, params, c) for s, ser in test_map.items()}
+        broker, eq = run(c, test_map, test_sigs)
+        test_st = stats(eq, broker.trades, c.starting_capital, tf_hours=tf_hours)
+        test_bh = buy_and_hold(test_map)
+        rows.append({
+            "window": w + 1,
+            "train_start": datetime.utcfromtimestamp(w_start / 1000).strftime("%Y-%m-%d"),
+            "test_start": datetime.utcfromtimestamp(split / 1000).strftime("%Y-%m-%d"),
+            "params": params,
+            "train_return": best["total_return"], "train_alpha": best["alpha"],
+            "test_return": test_st["total_return"], "test_bh": test_bh,
+            "test_alpha": test_st["total_return"] - test_bh,
+            "test_sharpe": test_st["sharpe"], "test_n_trades": test_st["n_trades"],
+        })
+    return rows
+
+
 def sweep(cfg, ohlcv_map, tf_hours):
-    n = len(GRID_BUY) * len(GRID_SELL) * len(GRID_MNP) * len(GRID_PERIOD)
-    print(f"Grid: {len(GRID_BUY)}x{len(GRID_SELL)}x{len(GRID_MNP)}x{len(GRID_PERIOD)} = {n} combos")
-    results, bh = _run_grid(cfg, ohlcv_map, tf_hours, verbose=True)
+    gen, _ = STRATEGIES["rsi"]
+    grid = _grid({"rsi_buy": GRID_BUY, "rsi_sell": GRID_SELL,
+                  "min_net_profit": GRID_MNP, "rsi_period": GRID_PERIOD})
+    print(f"Grid: {len(grid)} combos")
+    results, bh = _run_grid(cfg, ohlcv_map, tf_hours, gen, grid, verbose=True)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     with open(f"{RESULTS_DIR}/sweep.csv", "w", newline="") as f:
@@ -323,71 +427,44 @@ def sweep(cfg, ohlcv_map, tf_hours):
     return results
 
 
-def walk_forward(cfg, ohlcv_map, tf_hours):
-    """4 non-overlapping windows of ~6 months; train on first 5/6, test on last 1/6."""
-    all_ts = sorted({r[0] for series in ohlcv_map.values() for r in series})
-    span = all_ts[-1] - all_ts[0]
-    win_ms = span // 4
-    train_frac = 5 / 6
+def _pstr(params):
+    parts = []
+    for k, v in params.items():
+        if k == "min_net_profit":
+            if v < 0:
+                continue                                  # sentinel: profit gate disabled
+            parts.append(f"mnp={v:.0%}")
+        else:
+            parts.append(f"{k}={v}")
+    return " ".join(parts)
 
-    print(f"\nWalk-forward: 4 windows of ~6mo (5mo train / 1mo test)")
-    rows = []
-    for w in range(4):
-        w_start = all_ts[0] + w * win_ms
-        w_end = w_start + win_ms
-        split = w_start + int(win_ms * train_frac)
-        train_map = {s: [r for r in series if w_start <= r[0] < split]
-                     for s, series in ohlcv_map.items()}
-        test_map = {s: [r for r in series if split <= r[0] < w_end]
-                    for s, series in ohlcv_map.items()}
-        if any(len(v) < 100 for v in train_map.values()):
-            print(f"  window {w+1}: too little data, skipping")
-            continue
 
-        print(f"  window {w+1}: training on "
-              f"{datetime.utcfromtimestamp(w_start/1000):%Y-%m-%d} -> "
-              f"{datetime.utcfromtimestamp(split/1000):%Y-%m-%d} ...")
-        train_res, _ = _run_grid(cfg, train_map, tf_hours)
-        best = train_res[0]
-        params = {k: best[k] for k in ("rsi_buy", "rsi_sell", "min_net_profit", "rsi_period")}
-
-        c = replace(cfg, **params)
-        broker, eq = run(c, test_map)
-        test_st = stats(eq, broker.trades, c.starting_capital, tf_hours=tf_hours)
-        test_bh = buy_and_hold(test_map)
-        rows.append({
-            "window": w + 1,
-            "train_start": datetime.utcfromtimestamp(w_start/1000).strftime("%Y-%m-%d"),
-            "test_start": datetime.utcfromtimestamp(split/1000).strftime("%Y-%m-%d"),
-            **params,
-            "train_return": best["total_return"], "train_alpha": best["alpha"],
-            "test_return": test_st["total_return"], "test_bh": test_bh,
-            "test_alpha": test_st["total_return"] - test_bh,
-            "test_sharpe": test_st["sharpe"], "test_n_trades": test_st["n_trades"],
-        })
-
+def walk_forward(cfg, ohlcv_map, tf_hours, strategy="rsi"):
+    """4 non-overlapping windows of ~6 months; train grid on first 5/6, test on last 1/6."""
+    gen, grid = STRATEGIES[strategy]
+    print(f"\nWalk-forward ({strategy}): 4 windows of ~6mo (5mo train / 1mo test)")
+    rows = _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid)
     if not rows:
         print("no windows produced results")
         return []
 
-    print(f"\n  {'win':3s}  {'test_period':22s}  {'best_params':30s}  "
+    print(f"\n  {'win':3s}  {'test_period':22s}  {'best_params':34s}  "
           f"{'train_ret':>9s} {'train_alpha':>11s} {'test_ret':>9s} {'test_alpha':>10s}")
     for r in rows:
-        pstr = f"b={r['rsi_buy']} s={r['rsi_sell']} mnp={r['min_net_profit']:.0%} p={r['rsi_period']}"
-        period = f"{r['test_start']} + 1mo"
-        print(f"  {r['window']:<3d}  {period:22s}  {pstr:30s}  "
+        print(f"  {r['window']:<3d}  {r['test_start'] + ' + 1mo':22s}  {_pstr(r['params']):34s}  "
               f"{r['train_return']:+9.1%} {r['train_alpha']:+11.1%} "
               f"{r['test_return']:+9.1%} {r['test_alpha']:+10.1%}")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    flat = [{**{k: v for k, v in r.items() if k != "params"}, **r["params"]} for r in rows]
     with open(f"{RESULTS_DIR}/walk_forward.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, list(rows[0].keys()))
+        w = csv.DictWriter(f, list(flat[0].keys()))
         w.writeheader()
-        w.writerows(rows)
+        w.writerows(flat)
 
     train_avg = float(np.mean([r["train_return"] for r in rows]))
     test_avg = float(np.mean([r["test_return"] for r in rows]))
-    distinct = len({(r["rsi_buy"], r["rsi_sell"], r["min_net_profit"], r["rsi_period"]) for r in rows})
+    distinct = len({tuple(sorted(r["params"].items())) for r in rows})
     print(f"\n  train avg ret {train_avg:+.1%}  |  test avg ret {test_avg:+.1%}")
     print(f"  distinct best-param sets across {len(rows)} windows: {distinct}")
     if test_avg < train_avg - 0.02 or distinct >= max(3, len(rows)):
@@ -398,14 +475,121 @@ def walk_forward(cfg, ohlcv_map, tf_hours):
     return rows
 
 
+# --- Market survey --------------------------------------------------------
+
+SURVEY_ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT"]  # LINK: mid-cap (MATIC->POL renamed)
+SURVEY_TFS = ["15m", "1h", "4h", "1d"]
+
+
+def _cell(cfg, ohlcv_map, tf_hours, strategy):
+    """One (tf x asset x strategy) cell: out-of-sample walk-forward summary."""
+    gen, grid = STRATEGIES[strategy]
+    rows = _walk_forward(cfg, ohlcv_map, tf_hours, gen, grid)
+    if not rows:
+        return {"test_alpha": 0.0, "wf_gap": 0.0, "test_return": 0.0, "bh_return": 0.0,
+                "sharpe": 0.0, "n_trades": 0, "n_windows": 0, "param_churn": 0}
+    train_avg = float(np.mean([r["train_return"] for r in rows]))
+    test_avg = float(np.mean([r["test_return"] for r in rows]))
+    return {
+        "test_alpha": float(np.mean([r["test_alpha"] for r in rows])),   # out-of-sample vs B&H
+        "wf_gap": train_avg - test_avg,                                  # overfit gap
+        "test_return": test_avg,
+        "bh_return": float(np.mean([r["test_bh"] for r in rows])),
+        "sharpe": float(np.mean([r["test_sharpe"] for r in rows])),
+        "n_trades": int(sum(r["test_n_trades"] for r in rows)),
+        "n_windows": len(rows),
+        "param_churn": len({tuple(sorted(r["params"].items())) for r in rows}),
+    }
+
+
+def _survey_heatmap(cells):
+    """One asset x timeframe heatmap per strategy, colored by out-of-sample alpha."""
+    strategies = list(STRATEGIES)
+    lut = {(c["strategy"], c["timeframe"], c["asset"]): c for c in cells}
+    fig, axes = plt.subplots(1, len(strategies), figsize=(4 * len(strategies), 4), squeeze=False)
+    vmax = max((abs(c["test_alpha"]) for c in cells), default=0.05) or 0.05
+    for ax, sname in zip(axes[0], strategies):
+        grid = np.array([[lut.get((sname, tf, a), {}).get("test_alpha", np.nan)
+                          for tf in SURVEY_TFS] for a in SURVEY_ASSETS])
+        ax.imshow(grid, cmap="RdYlGn", vmin=-vmax, vmax=vmax, aspect="auto")
+        ax.set_xticks(range(len(SURVEY_TFS)), SURVEY_TFS)
+        ax.set_yticks(range(len(SURVEY_ASSETS)), [a.split("/")[0] for a in SURVEY_ASSETS])
+        ax.set_title(sname)
+        for yi, a in enumerate(SURVEY_ASSETS):
+            for xi, tf in enumerate(SURVEY_TFS):
+                c = lut.get((sname, tf, a))
+                if c:
+                    ax.text(xi, yi, f"{c['test_alpha']:+.0%}\nn{c['n_trades']}",
+                            ha="center", va="center", fontsize=7)
+    fig.suptitle("Out-of-sample alpha vs buy-and-hold (green=beats B&H after fees)")
+    fig.tight_layout()
+    fig.savefig(f"{RESULTS_DIR}/survey_heatmap.png", dpi=100)
+    plt.close(fig)
+
+
+def survey(years, exchange):
+    """Sweep timeframe x asset x strategy; dump one CSV. Goal: which shape has a pulse?"""
+    cells = []
+    for tf in SURVEY_TFS:
+        tf_hours = ccxt.Exchange.parse_timeframe(tf) / 3600
+        for asset in SURVEY_ASSETS:
+            print(f"loading {asset} {tf} ...")
+            try:
+                series = fetch_ohlcv(asset, tf=tf, years=years, exchange_id=exchange)
+            except Exception as e:
+                print(f"  skip {asset} {tf}: {e}")
+                continue
+            if len(series) < 400:
+                print(f"  skip {asset} {tf}: only {len(series)} candles")
+                continue
+            ohlcv_map = {asset: series}
+            cfg = replace(Config.load(), taker_fee=EFF_FEE, tds_rate=TDS_RATE, timeframe=tf)
+            for strat in STRATEGIES:
+                m = _cell(cfg, ohlcv_map, tf_hours, strat)
+                row = {"timeframe": tf, "asset": asset, "strategy": strat, **m}
+                cells.append(row)
+                pulse = "PULSE" if m["test_alpha"] > 0 and m["n_trades"] >= 4 else "."
+                print(f"  {strat:9s} test_alpha={m['test_alpha']:+.1%} "
+                      f"wf_gap={m['wf_gap']:+.1%} sharpe={m['sharpe']:+.2f} "
+                      f"n={m['n_trades']:<4d} {pulse}")
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    cells.sort(key=lambda r: r["test_alpha"], reverse=True)
+    with open(f"{RESULTS_DIR}/survey.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, list(cells[0].keys()))
+        w.writeheader()
+        w.writerows(cells)
+    _survey_heatmap(cells)
+
+    winners = [c for c in cells if c["test_alpha"] > 0 and c["n_trades"] >= 4]
+    print(f"\n{'='*60}")
+    print(f"Cells with a pulse (out-of-sample alpha > 0, >=4 trades): {len(winners)}/{len(cells)}")
+    for c in winners[:10]:
+        print(f"  {c['timeframe']:4s} {c['asset']:9s} {c['strategy']:9s}  "
+              f"alpha={c['test_alpha']:+.1%} gap={c['wf_gap']:+.1%} "
+              f"sharpe={c['sharpe']:+.2f} n={c['n_trades']}")
+    if not winners:
+        print("  NONE. No (tf x asset x strategy) beats buy-and-hold out-of-sample after fees.")
+        print("  -> The honest answer: this problem shape has no pulse. Pivot before ML.")
+    print(f"-> {RESULTS_DIR}/survey.csv")
+    return cells
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--walk-forward", action="store_true")
+    ap.add_argument("--survey", action="store_true", help="tf x asset x strategy market survey")
+    ap.add_argument("--strategy", default="rsi", choices=list(STRATEGIES),
+                    help="strategy for --walk-forward / single run")
     ap.add_argument("--years", type=float, default=2.0)
     ap.add_argument("--tf", default="1h")
     ap.add_argument("--exchange", default="binance")
     args = ap.parse_args()
+
+    if args.survey:
+        survey(args.years, args.exchange)
+        return
 
     cfg = replace(Config.load(), taker_fee=EFF_FEE, tds_rate=TDS_RATE, timeframe=args.tf)
     tf_hours = ccxt.Exchange.parse_timeframe(args.tf) / 3600
@@ -421,9 +605,15 @@ def main():
     if args.sweep:
         sweep(cfg, ohlcv_map, tf_hours)
     if args.walk_forward:
-        walk_forward(cfg, ohlcv_map, tf_hours)
+        walk_forward(cfg, ohlcv_map, tf_hours, strategy=args.strategy)
     if not (args.sweep or args.walk_forward):
-        broker, eq = run(cfg, ohlcv_map)
+        if args.strategy == "rsi":
+            broker, eq = run(cfg, ohlcv_map)                  # cfg's own RSI params (config.py)
+        else:
+            gen, grid = STRATEGIES[args.strategy]
+            c = _apply(cfg, grid[0])
+            sigs = {s: gen(ser, grid[0], c) for s, ser in ohlcv_map.items()}
+            broker, eq = run(c, ohlcv_map, sigs)
         s = stats(eq, broker.trades, cfg.starting_capital, tf_hours=tf_hours)
         save_outputs(broker, eq, s)
         print()
