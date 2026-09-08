@@ -4,3 +4,4 @@ agent.db
 .env
 data/
 results/
+logs/
