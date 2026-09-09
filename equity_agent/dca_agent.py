@@ -46,6 +46,9 @@ def _envbool(k, default):
 @dataclass
 class DcaConfig:
     dry_run: bool = field(default_factory=lambda: _envbool("DRY_RUN", True))
+    # lump: deploy all available cash now, then buy only newly-detected cash (XIRR says cash
+    # drag costs ~5%/yr, so this is the default). schedule: fixed weekly amount.
+    deploy_mode: str = os.environ.get("DEPLOY_MODE", "lump")
     instrument: str = os.environ.get("DCA_INSTRUMENT", "NIFTYBEES")
     basket: tuple = ()                      # e.g. ("RELIANCE","TCS","HDFCBANK"); overrides instrument
     amount: float = field(default_factory=lambda: float(os.environ.get("DCA_AMOUNT", 1000)))
@@ -85,6 +88,12 @@ def scheduled_buy_date(today, weekday, holidays=NSE_HOLIDAYS):
     return next_trading_day(monday + timedelta(days=weekday), holidays)
 
 
+def is_market_open(now, holidays=NSE_HOLIDAYS):
+    """NSE cash session: trading day, 09:15-15:30 IST."""
+    from datetime import time as _t
+    return is_trading_day(now.date(), holidays) and _t(9, 15) <= now.time() <= _t(15, 30)
+
+
 # --- the agent ------------------------------------------------------------
 
 class DcaAgent:
@@ -111,31 +120,39 @@ class DcaAgent:
     def already_bought_this_week(self, today):
         return self.db.get_flag("last_buy_week") == today.strftime("%G-W%V")
 
-    def plan_orders(self, cash, holdings, port_value):
-        """Return [(symbol, side, qty, ltp, amount, reason)]. One DCA buy per target, plus
-        threshold-triggered rebalances when a holding drifts past the band."""
+    # lump mode: in paper (dry_run) the account balance never drops, so we simulate the
+    # cash leaving with an offset -> "new cash" detection works identically to live.
+    def effective_cash(self, cash):
+        return cash - float(self.db.get_flag("sim_cash_offset") or 0.0)
+
+    def record_deployed(self, net_amount):
+        if self.cfg.dry_run:
+            offset = float(self.db.get_flag("sim_cash_offset") or 0.0)
+            self.db.set_flag("sim_cash_offset", offset + net_amount)
+
+    def plan_orders(self, deploy_amount, holdings, port_value, reason="dca"):
+        """Return [(symbol, side, qty, ltp, amount, reason)] to deploy `deploy_amount` across
+        targets, plus threshold-triggered rebalances when a holding drifts past the band."""
         targets = self.cfg.targets
-        invest = port_value + self.cfg.amount            # value after this week's contribution
+        invest = port_value + deploy_amount
         ltps = {s: self.client.ltp(s) for s in targets}
         cur_val = {s: holdings.get(_ts(s), {}).get("value", 0.0) for s in targets}
-
         drifted = any(abs(cur_val[s] / port_value - targets[s]) > self.cfg.rebalance_threshold
                       for s in targets) if port_value > 0 else False
 
         orders = []
         for s in targets:
-            target_val = targets[s] * invest
             if drifted and len(targets) > 1:
-                delta = target_val - cur_val[s]          # rebalance toward target
-                reason = "rebalance+dca"
+                delta = targets[s] * invest - cur_val[s]  # rebalance toward target
+                r = "rebalance+" + reason
             else:
-                delta = self.cfg.amount * targets[s]      # just deploy this week's cash
-                reason = "dca"
+                delta = deploy_amount * targets[s]        # deploy this run's cash
+                r = reason
             qty = int(delta // ltps[s])
             if qty >= 1:
-                orders.append((s, "BUY", qty, ltps[s], qty * ltps[s], reason))
+                orders.append((s, "BUY", qty, ltps[s], qty * ltps[s], r))
             elif qty <= -1:
-                orders.append((s, "SELL", -qty, ltps[s], -qty * ltps[s], reason))
+                orders.append((s, "SELL", -qty, ltps[s], -qty * ltps[s], r))
         return orders
 
     def execute(self, order, run_date):
@@ -160,34 +177,55 @@ class DcaAgent:
 
     def run_once(self):
         self.client.ensure_session()
-        today = datetime.now(IST).date()
+        now = datetime.now(IST)
+        today = now.date()
         equity, cash, holdings = self.snapshot()
         life, paused = self.risk.update_pause(equity)
         self.db.snapshot(equity, cash, life, paused)
-        self.log(f"equity=Rs{equity:.0f} cash=Rs{cash:.0f} life={life:.0%} "
-                 f"paused={paused} dry_run={self.cfg.dry_run}")
+        self.log(f"equity=Rs{equity:.0f} cash=Rs{cash:.0f} life={life:.0%} paused={paused} "
+                 f"mode={self.cfg.deploy_mode} dry_run={self.cfg.dry_run}")
 
         summary = {"date": today.isoformat(), "equity": round(equity), "life": round(life, 3),
-                   "paused": paused, "dry_run": self.cfg.dry_run, "orders": []}
+                   "paused": paused, "dry_run": self.cfg.dry_run, "mode": self.cfg.deploy_mode,
+                   "orders": []}
         if paused:
             self.log("life below floor -> buying paused")
             self.alert({**summary, "note": "paused"})
             return
-        buy_date = scheduled_buy_date(today, self.cfg.cadence_weekday)
-        if today != buy_date:
-            self.log(f"not a buy day (next scheduled buy {buy_date.isoformat()})")
-            return
-        if self.already_bought_this_week(today):
-            self.log("already bought this week")
-            return
-        if cash < self.cfg.amount:
-            self.log(f"insufficient cash (Rs{cash:.0f} < Rs{self.cfg.amount:.0f}) -> skip")
-            self.alert({**summary, "note": "insufficient_cash"})
+        if not is_market_open(now):
+            self.log("market closed -> no action")
             return
 
-        for order in self.plan_orders(cash, holdings, equity):
+        if self.cfg.deploy_mode == "lump":
+            deploy = self.effective_cash(cash)
+            if deploy < 1:
+                self.log("no new cash to deploy")
+                return
+            orders = self.plan_orders(deploy, holdings, equity, reason="lump")
+        else:                                             # schedule: fixed weekly amount
+            buy_date = scheduled_buy_date(today, self.cfg.cadence_weekday)
+            if today != buy_date:
+                self.log(f"not a buy day (next scheduled buy {buy_date.isoformat()})")
+                return
+            if self.already_bought_this_week(today):
+                self.log("already bought this week")
+                return
+            if cash < self.cfg.amount:
+                self.log(f"insufficient cash (Rs{cash:.0f} < Rs{self.cfg.amount:.0f}) -> skip")
+                self.alert({**summary, "note": "insufficient_cash"})
+                return
+            orders = self.plan_orders(self.cfg.amount, holdings, equity, reason="dca")
+
+        if not orders:
+            self.log("nothing deployable this run")
+            return
+        for order in orders:
             summary["orders"].append(self.execute(order, today))
-        self.db.set_flag("last_buy_week", today.strftime("%G-W%V"))
+        net = sum(o[4] if o[1] == "BUY" else -o[4] for o in orders)  # net cash deployed
+        if self.cfg.deploy_mode == "lump":
+            self.record_deployed(net)
+        else:
+            self.db.set_flag("last_buy_week", today.strftime("%G-W%V"))
         self.alert(summary)
 
     def alert(self, payload):
@@ -204,14 +242,15 @@ class DcaAgent:
             self.log(f"alert failed: {e}")
 
     def loop(self):
-        self.log(f"DCA agent up. instrument={self.cfg.instrument} basket={self.cfg.basket} "
-                 f"amount=Rs{self.cfg.amount:.0f} dry_run={self.cfg.dry_run}")
+        self.log(f"DCA agent up. mode={self.cfg.deploy_mode} instrument={self.cfg.instrument} "
+                 f"basket={self.cfg.basket} amount=Rs{self.cfg.amount:.0f} dry_run={self.cfg.dry_run}")
         while True:
             try:
                 self.run_once()
             except Exception:
                 import traceback
-                self.log("cycle error:\n" + traceback.format_exc())
+                self.log("cycle error (will re-login next cycle):\n" + traceback.format_exc())
+                self.client._login_date = None    # force fresh login next cycle (token/net drop)
             time.sleep(self.cfg.poll_seconds)
 
 
@@ -444,12 +483,27 @@ def _selftest():
     # two equal contributions, doubles at end -> XIRR positive and sane
     r = xirr([(date(2020, 1, 1), -100.0), (date(2021, 1, 1), -100.0), (date(2022, 1, 1), 260.0)])
     assert 0.18 < r < 0.19, r        # closed-form: x^2+x-2.6=0 -> r=18.8%
-    print("selftest ok: calendar roll-forward + rupee-cost-averaging + XIRR behave")
+
+    # lump-mode cash detection: deploy once, then nothing until fresh cash appears
+    class _Fake:
+        def ensure_session(self): pass
+    ag = DcaAgent(DcaConfig(db_path=":memory:", deploy_mode="lump", dry_run=True), client=_Fake())
+    assert ag.effective_cash(1000) == 1000       # first run: all cash deployable
+    ag.record_deployed(1000)                      # paper: simulate the cash leaving
+    assert ag.effective_cash(1000) == 0           # same balance -> no new cash
+    assert ag.effective_cash(1500) == 500         # a Rs500 deposit is detected
+    live = DcaAgent(DcaConfig(db_path=":memory:", deploy_mode="lump", dry_run=False), client=_Fake())
+    live.record_deployed(1000)                     # live: real cash moves, no sim offset
+    assert live.effective_cash(1000) == 1000
+    print("selftest ok: calendar + RCA + XIRR + lump cash-detection behave")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="run one cycle and exit (cron mode)")
+    ap.add_argument("--paper-live", action="store_true",
+                    help="soak test: real schedule + live prices in real time, logs orders, "
+                         "places nothing (forces DRY_RUN, meant to run for days/weeks)")
     ap.add_argument("--backtest", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -460,6 +514,15 @@ def main():
         return
     if args.backtest:
         backtest()
+        return
+
+    if args.paper_live:
+        cfg = DcaConfig()
+        cfg.dry_run = True                          # paper-live NEVER places, whatever the env says
+        agent = DcaAgent(cfg)
+        agent.log("PAPER-LIVE soak: real schedule + live prices, logging intended orders, "
+                  "placing NOTHING. Ctrl-C to stop.")
+        agent.loop()
         return
 
     agent = DcaAgent(DcaConfig())
