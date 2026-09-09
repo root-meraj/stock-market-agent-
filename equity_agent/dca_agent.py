@@ -236,6 +236,46 @@ def _maxdd(series):
     return mdd
 
 
+def xirr(cashflows):
+    """Money-weighted annualized return. cashflows: [(date, amount)], outflows negative.
+    Newton's method with a bisection fallback for robustness."""
+    t0 = cashflows[0][0]
+    yrs = [(d - t0).days / 365.0 for d, _ in cashflows]
+    amt = [a for _, a in cashflows]
+
+    def npv(r):
+        return sum(a / (1 + r) ** y for a, y in zip(amt, yrs))
+
+    r = 0.1
+    for _ in range(80):
+        d = sum(-y * a / (1 + r) ** (y + 1) for a, y in zip(amt, yrs))
+        if abs(d) < 1e-9:
+            break
+        step = npv(r) / d
+        r -= step
+        if r <= -0.9999:
+            r = -0.99
+        if abs(step) < 1e-8:
+            return r
+    lo, hi = -0.9999, 10.0                                # bisection fallback
+    if npv(lo) * npv(hi) > 0:
+        return r
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        (lo, hi) = (lo, mid) if npv(lo) * npv(mid) <= 0 else (mid, hi)
+    return (lo + hi) / 2
+
+
+def _sharpe(series, contribs):
+    """Annualized Sharpe on daily returns, with external contributions removed so weekly
+    DCA top-ups don't masquerade as investment returns. rf=0."""
+    import numpy as np
+    eq = [v for _, v in series]
+    rets = [(eq[i] - contribs[i]) / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
+    r = np.array(rets)
+    return float(r.mean() / r.std() * np.sqrt(252)) if len(r) and r.std() > 0 else 0.0
+
+
 def backtest(years=8.0):
     import backtest as bt
     client = AngelClient()
@@ -247,55 +287,96 @@ def backtest(years=8.0):
 
     print("loading NIFTYBEES ONE_DAY ...")
     nb = client.fetch_ohlcv("NIFTYBEES", "ONE_DAY", f, t)
-    weekly_amount = 1000.0
+    weekly = 1000.0
+    n_weeks = len({_isoweek(r[0]) for r in nb})
+    total = weekly * n_weeks
 
-    # weekly DCA into NIFTYBEES
-    units = 0.0
-    invested = 0.0
-    buys = []
-    dca_series = []
+    def d(ts):
+        return datetime.fromtimestamp(ts / 1000).date()
+
+    # weekly DCA + deferred (same buys, but the full `total` is committed as cash on day 0)
+    units = spent = 0.0
+    buys, dca_series, dca_contribs, deferred_series = [], [], [], []
     seen = set()
     for row in nb:
         ts, px = row[0], row[4]
-        wk = _isoweek(ts)
-        if wk not in seen:
-            seen.add(wk)
-            u = (weekly_amount - cost.buy_cost(weekly_amount)) / px
-            units += u
-            invested += weekly_amount
-            buys.append((ts, px, u, weekly_amount))
+        c = 0.0
+        if _isoweek(ts) not in seen:
+            seen.add(_isoweek(ts))
+            units += (weekly - cost.buy_cost(weekly)) / px
+            spent += weekly
+            c = weekly
+            buys.append((ts, px, (weekly - cost.buy_cost(weekly)) / px, weekly))
         dca_series.append((ts, units * px))
-    n_weeks = len(seen)
-    total = weekly_amount * n_weeks
+        dca_contribs.append(c)
+        deferred_series.append((ts, units * px + (total - spent)))   # + idle cash reserve
+    dca_cf = [(d(ts), -weekly) for ts, *_ in buys] + [(d(nb[-1][0]), dca_series[-1][1])]
 
     # lump-sum: whole `total` on day 0
     px0 = nb[0][4]
     u0 = (total - cost.buy_cost(total)) / px0
     lump_series = [(r[0], u0 * r[4]) for r in nb]
 
-    # equal-weight B&H of the 10 cached stocks (a diversified alternative)
+    # equal-weight B&H of the 10 cached stocks (diversified alternative)
     stocks = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
               "ITC", "LT", "SBIN", "BHARTIARTL", "MARUTI"]
     per = total / len(stocks)
-    ew_units = {}
-    prices = {}
+    prices, ew_units = {}, {}
     for s in stocks:
-        ser = client.fetch_ohlcv(s, "ONE_DAY", f, t)
-        prices[s] = ser
-        ew_units[s] = (per - cost.buy_cost(per)) / ser[0][4]
+        prices[s] = client.fetch_ohlcv(s, "ONE_DAY", f, t)
+        ew_units[s] = (per - cost.buy_cost(per)) / prices[s][0][4]
     ew_series = [(r[0], sum(ew_units[s] * _asof(prices[s], r[0]) for s in stocks)) for r in nb]
 
-    print(f"\nHorizon {frm:%Y-%m-%d} -> {to:%Y-%m-%d}: {n_weeks} weekly buys, "
-          f"Rs{weekly_amount:.0f}/wk = Rs{total:,.0f} total deployed\n")
-    print(f"  {'strategy':22s} {'final value':>14s} {'return':>9s} {'max DD':>8s}")
-    for name, series, cap in [("weekly DCA (NIFTYBEES)", dca_series, invested),
-                              ("lump-sum (NIFTYBEES)", lump_series, total),
-                              ("equal-weight B&H (10)", ew_series, total)]:
-        fv = series[-1][1]
-        print(f"  {name:22s} {fv:>14,.0f} {fv/total-1:>+8.1%} {_maxdd(series):>7.1%}")
-    print("  (DCA return is on Rs deployed over time; lump-sum/B&H on the full sum at day 0)")
+    day0, last = d(nb[0][0]), d(nb[-1][0])
+    zero = [0.0] * len(nb)
+    rows = [
+        ("weekly DCA (NIFTYBEES)", dca_series, dca_contribs, dca_cf),
+        ("lump-sum day-0 (NIFTYBEES)", lump_series, zero, [(day0, -total), (last, lump_series[-1][1])]),
+        ("deferred: cash, deploy wkly", deferred_series, zero, [(day0, -total), (last, deferred_series[-1][1])]),
+        ("equal-weight B&H (10)", ew_series, zero, [(day0, -total), (last, ew_series[-1][1])]),
+    ]
 
+    print(f"\nHorizon {frm:%Y-%m-%d} -> {to:%Y-%m-%d}: {n_weeks} weekly buys, "
+          f"Rs{weekly:.0f}/wk = Rs{total:,.0f}\n")
+    print(f"  {'strategy':28s} {'final value':>13s} {'XIRR':>7s} {'Sharpe':>7s} {'max DD':>8s}")
+    for name, series, contribs, cf in rows:
+        print(f"  {name:28s} {series[-1][1]:>13,.0f} {xirr(cf):>+6.1%} "
+              f"{_sharpe(series, contribs):>+7.2f} {_maxdd(series):>7.1%}")
+    print("  XIRR is money-weighted on actual cashflow dates -> comparable across timelines.")
+    print("  timing effect  = DCA vs lump-sum XIRR (near-equal -> averaging is a wash here)")
+    print("  exposure effect = lump-sum vs deferred XIRR (both hold Rs%s day-0; cash drag costs the gap)"
+          % f"{total:,.0f}")
+
+    _plot(rows, os.path.join(ROOT, "results", "dca_comparison.png"))
     _rca_2025(nb, buys, cost)
+
+
+def _plot(rows, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    show = [r for r in rows if "deferred" not in r[0]]        # the 3 the user asked to see
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True,
+                                   gridspec_kw={"height_ratios": [2, 1]})
+    for name, series, _c, _cf in show:
+        xs = [datetime.fromtimestamp(ts / 1000) for ts, _ in series]
+        eq = np.array([v for _, v in series])
+        ax1.plot(xs, eq, linewidth=1, label=name)
+        peak = np.maximum.accumulate(eq)
+        ax2.fill_between(xs, (eq - peak) / peak * 100, 0, alpha=0.35)
+        ax2.plot(xs, (eq - peak) / peak * 100, linewidth=0.8, label=name)
+    ax1.set_ylabel("portfolio value (Rs)")
+    ax1.legend(loc="upper left", fontsize=8)
+    ax1.grid(alpha=0.3)
+    ax2.set_ylabel("drawdown (%)")
+    ax2.grid(alpha=0.3)
+    fig.suptitle("Weekly DCA vs lump-sum vs equal-weight B&H (NIFTYBEES, 8y)")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+    print(f"-> {path}")
 
 
 def _asof(series, ts):
@@ -358,7 +439,12 @@ def _selftest():
     u_hi = (1000 - c.buy_cost(1000)) / px_hi
     u_lo = (1000 - c.buy_cost(1000)) / px_lo
     assert u_lo > u_hi * 1.9
-    print("selftest ok: calendar roll-forward + rupee-cost-averaging behave")
+    # XIRR: -100 today, +110 in one year -> ~10%
+    assert abs(xirr([(date(2025, 1, 1), -100.0), (date(2026, 1, 1), 110.0)]) - 0.10) < 1e-3
+    # two equal contributions, doubles at end -> XIRR positive and sane
+    r = xirr([(date(2020, 1, 1), -100.0), (date(2021, 1, 1), -100.0), (date(2022, 1, 1), 260.0)])
+    assert 0.18 < r < 0.19, r        # closed-form: x^2+x-2.6=0 -> r=18.8%
+    print("selftest ok: calendar roll-forward + rupee-cost-averaging + XIRR behave")
 
 
 def main():
