@@ -6,3 +6,4 @@ smartapi-python>=1.4
 pyotp>=2.9
 logzero>=1.7            # undeclared smartapi-python dep
 websocket-client>=1.6  # undeclared smartapi-python dep
+yfinance>=0.2
