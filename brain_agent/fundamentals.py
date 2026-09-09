@@ -104,11 +104,19 @@ def cache_earnings(symbols=NIFTY, force=False):
 
 def load_earnings(symbol):
     """[(announce_ms, est, reported, surprise_pct)] with both est & reported present."""
+    return [(ms, est, rep, sur) for ms, est, rep, sur in load_earnings_reported(symbol)
+            if est is not None]
+
+
+def load_earnings_reported(symbol):
+    """[(announce_ms, est_or_None, reported, surprise_or_None)] for rows with reported EPS.
+    Keeps estimate-less rows so the YoY surprise proxy can use them (smallcap coverage)."""
     out = []
     for r in _read(os.path.join(DATA, "earnings", f"{symbol}.csv"))[1:]:
         est, rep, sur = _num(r[1]), _num(r[2]), _num(r[3])
-        if est is not None and rep is not None:
+        if rep is not None:
             out.append((int(r[0]), est, rep, sur))
+    out.sort(key=lambda x: x[0])
     return out
 
 
@@ -216,6 +224,26 @@ def recent_delivery(symbols=None, lookback=6):
     return None, {}
 
 
+def index_constituents(which):
+    """Symbols in an NSE index. which in {'smallcap250','midcap150'}. CURRENT membership only
+    (niftyindices publishes no free point-in-time history -> survivorship bias, flagged in pead)."""
+    url = f"https://niftyindices.com/IndexConstituent/ind_nifty{which}list.csv"
+    txt = _nse().get(url, timeout=15).text
+    rows = list(csv.reader(txt.splitlines()))
+    header = rows[0]
+    si = header.index("Symbol")
+    return [r[si].strip() for r in rows[1:] if len(r) > si and r[si].strip()]
+
+
+def smallmid_universe():
+    path = os.path.join(DATA, "smallmid_universe.csv")
+    if os.path.exists(path):
+        return [r[0] for r in _read(path)[1:]]
+    syms = sorted(set(index_constituents("smallcap250")) | set(index_constituents("midcap150")))
+    _write(path, ["symbol"], [[s] for s in syms])
+    return syms
+
+
 def _num(x):
     try:
         if x is None or x != x:          # None or NaN
@@ -242,14 +270,19 @@ def main():
     ap.add_argument("--earnings", action="store_true")
     ap.add_argument("--prices", action="store_true")
     ap.add_argument("--nse", action="store_true")
+    ap.add_argument("--smallmid", action="store_true",
+                    help="cache earnings+prices for Nifty Smallcap250 + Midcap150 constituents")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
     if args.probe:
         probe()
-    if args.earnings:
-        cache_earnings(force=args.force)
-    if args.prices:
-        cache_prices(force=args.force)
+    universe = smallmid_universe() if args.smallmid else NIFTY
+    if args.smallmid:
+        print(f"smallmid universe: {len(universe)} current constituents")
+    if args.earnings or args.smallmid:
+        cache_earnings(universe, force=args.force)
+    if args.prices or args.smallmid:
+        cache_prices(universe, force=args.force)
     if args.nse:
         print("FII/DII:", fii_dii_latest())
         for a in announcements(subject="result", limit=50)[:5]:
