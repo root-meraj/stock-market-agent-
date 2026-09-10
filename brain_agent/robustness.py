@@ -88,6 +88,54 @@ def regime_split(ser, ppy, slip=SLIP):
               f"{s['mde']:>+6.1%} {nif:>+7.1%}{verdict}")
 
 
+def wide_post2022():
+    """Out-of-sample-in-time test: 2022-01 -> present, Nifty-500 breadth. Power is reported
+    BEFORE the result -- MDE = 2*sigma/sqrt(n) where n is rebalance PERIODS, so widening the
+    universe only helps by shrinking sigma (better-diversified deciles); it cannot add periods."""
+    from fundamentals import index_constituents
+    nifty = load_prices("_NSEI")
+    wide = _load(index_constituents("500"))
+    narrow = _load(smallmid_universe())
+    lo, hi = _ms("2022-01-01"), _ms("2030-01-01")
+    print(f"universe: Nifty500 -> {len(wide)} names pass 3y-history + Rs2cr-turnover "
+          f"(vs {len(narrow)} in the mid/small set)\n")
+
+    cells = []
+    for label, step, ppy in (("monthly", 21, 12), ("quarterly", 63, 4)):
+        for uname, uni in (("Nifty500 (wide)", wide), ("mid/small 345 (narrow)", narrow)):
+            ser = momentum_series(uni, nifty, nifty, 126, SKIP, step)
+            m = (ser["ts"] >= lo) & (ser["ts"] <= hi)
+            sub = {k: v[m] for k, v in ser.items()}
+            drag0 = ROUNDTRIP
+            a0 = sub["d10"] - sub["turn10"] * drag0 - sub["ew"]
+            s = _stat(a0, ppy)
+            cells.append((label, uname, sub, ppy, s))
+
+    print("=" * 78)
+    print("POWER FIRST — can this test even answer the question?")
+    print("=" * 78)
+    print(f"  {'config':>12} {'universe':>24} {'periods':>8} {'sigma/period':>13} {'MDE(ann)':>9}")
+    for label, uname, sub, ppy, s in cells:
+        sigma = float((sub["d10"] - sub["turn10"] * ROUNDTRIP - sub["ew"]).std(ddof=1))
+        print(f"  {label:>12} {uname:>24} {s['n']:>8} {sigma:>12.1%} {s['mde']:>+8.1%}")
+    best = min(c[4]["mde"] for c in cells)
+    print(f"\n  best achievable MDE = {best:+.1%}  -> "
+          + ("BELOW 5%: the test can resolve a small edge."
+             if best < 0.05 else
+             "ABOVE the ~5% bar: this test still CANNOT distinguish a modest\n"
+             "     (3-5%) edge from zero. Read the result as bounded, not as proof."))
+
+    print("\n" + "=" * 78)
+    print("RESULT — post-2022 D10 vs equal-weight")
+    print("=" * 78)
+    print(f"  {'config':>12} {'universe':>24} {'slip':>5} {'alpha':>8} {'t':>6}")
+    for label, uname, sub, ppy, _s in cells:
+        for slip in (0.0, 0.003, 0.005):
+            drag = ROUNDTRIP + 2 * slip
+            st = _stat(sub["d10"] - sub["turn10"] * drag - sub["ew"], ppy)
+            print(f"  {label:>12} {uname:>24} {slip:>5.1%} {st['ann']:>+7.1%} {st['t']:>+6.2f}")
+
+
 def _selftest():
     ppy = 12
     n = 120
@@ -106,9 +154,14 @@ def _selftest():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--wide", action="store_true",
+                    help="post-2022 Nifty500-breadth out-of-sample-in-time power test")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
+        return
+    if args.wide:
+        wide_post2022()
         return
 
     nifty = load_prices("_NSEI")
