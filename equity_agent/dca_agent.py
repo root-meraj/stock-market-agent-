@@ -185,12 +185,13 @@ class DcaAgent:
         self.log(f"equity=Rs{equity:.0f} cash=Rs{cash:.0f} life={life:.0%} paused={paused} "
                  f"mode={self.cfg.deploy_mode} dry_run={self.cfg.dry_run}")
 
-        summary = {"date": today.isoformat(), "equity": round(equity), "life": round(life, 3),
-                   "paused": paused, "dry_run": self.cfg.dry_run, "mode": self.cfg.deploy_mode,
-                   "orders": []}
+        base = {"ts": now.isoformat(), "date": today.isoformat(), "mode": self.cfg.deploy_mode,
+                "dry_run": self.cfg.dry_run, "equity": round(equity, 2), "cash": round(cash, 2),
+                "life": round(life, 4), "paused": paused}
         if paused:
             self.log("life below floor -> buying paused")
-            self.alert({**summary, "note": "paused"})
+            self.alert({**base, "event": "paused",
+                        "note": f"life {life:.1%} below floor {self.cfg.pause_life:.0%}"})
             return
         if not is_market_open(now):
             self.log("market closed -> no action")
@@ -200,6 +201,8 @@ class DcaAgent:
             deploy = self.effective_cash(cash)
             if deploy < 1:
                 self.log("no new cash to deploy")
+                self.alert({**base, "event": "no_cash", "note": "no new cash detected",
+                            "deployable": round(deploy, 2)})
                 return
             orders = self.plan_orders(deploy, holdings, equity, reason="lump")
         else:                                             # schedule: fixed weekly amount
@@ -212,21 +215,24 @@ class DcaAgent:
                 return
             if cash < self.cfg.amount:
                 self.log(f"insufficient cash (Rs{cash:.0f} < Rs{self.cfg.amount:.0f}) -> skip")
-                self.alert({**summary, "note": "insufficient_cash"})
+                self.alert({**base, "event": "no_cash", "note": "insufficient cash for scheduled buy",
+                            "required": round(self.cfg.amount, 2), "deployable": round(cash, 2)})
                 return
             orders = self.plan_orders(self.cfg.amount, holdings, equity, reason="dca")
 
         if not orders:
             self.log("nothing deployable this run")
+            self.alert({**base, "event": "no_cash", "note": "cash below one tradeable unit",
+                        "deployable": round(cash, 2)})
             return
-        for order in orders:
-            summary["orders"].append(self.execute(order, today))
+        placed = [self.execute(order, today) for order in orders]
         net = sum(o[4] if o[1] == "BUY" else -o[4] for o in orders)  # net cash deployed
         if self.cfg.deploy_mode == "lump":
             self.record_deployed(net)
         else:
             self.db.set_flag("last_buy_week", today.strftime("%G-W%V"))
-        self.alert(summary)
+        self.alert({**base, "event": "buy", "orders": placed,
+                    "net_deployed": round(net, 2)})
 
     def alert(self, payload):
         if not self.cfg.webhook:
@@ -247,11 +253,71 @@ class DcaAgent:
         while True:
             try:
                 self.run_once()
-            except Exception:
+            except Exception as e:
                 import traceback
-                self.log("cycle error (will re-login next cycle):\n" + traceback.format_exc())
+                tb = traceback.format_exc()
+                self.log("cycle error (will re-login next cycle):\n" + tb)
                 self.client._login_date = None    # force fresh login next cycle (token/net drop)
+                self.alert({"ts": datetime.now(IST).isoformat(),
+                            "date": datetime.now(IST).date().isoformat(),
+                            "mode": self.cfg.deploy_mode, "dry_run": self.cfg.dry_run,
+                            "event": "error", "error": f"{type(e).__name__}: {e}",
+                            "traceback": tb[-800:]})
             time.sleep(self.cfg.poll_seconds)
+
+    # --- operator view: everything without reading logs ---
+    def status(self):
+        cfg = self.cfg
+        now = datetime.now(IST)
+        print(f"DCA agent status @ {now:%Y-%m-%d %H:%M:%S} IST")
+        print(f"  mode={cfg.deploy_mode}  instrument={cfg.instrument or cfg.basket}  "
+              f"amount=Rs{cfg.amount:.0f}  dry_run={cfg.dry_run}  db={cfg.db_path}")
+
+        row = self.db.c.execute(
+            "select ts, equity, cash, life, paused from equity order by ts desc limit 1").fetchone()
+        if row:
+            ts, eq, cash, life, paused = row
+            age = (time.time() - ts) / 60
+            print(f"\n  last run : {datetime.fromtimestamp(ts, IST):%Y-%m-%d %H:%M:%S} IST "
+                  f"({age:.0f} min ago)")
+            print(f"  life     : {life:.1%} of Rs{cfg.starting_capital:.0f}  "
+                  f"[pause<={cfg.pause_life:.0%} resume>={cfg.resume_life:.0%}]  "
+                  f"{'PAUSED' if paused else 'active'}")
+            print(f"  equity   : Rs{eq:,.2f}   cash: Rs{cash:,.2f}")
+        else:
+            print("\n  last run : never (no equity snapshots yet)")
+
+        if cfg.deploy_mode == "schedule":
+            done = self.already_bought_this_week(now.date())
+            nxt = scheduled_buy_date(now.date(), cfg.cadence_weekday)
+            if done or nxt < now.date():
+                nxt = scheduled_buy_date(now.date() + timedelta(days=7), cfg.cadence_weekday)
+            print(f"  next buy : {nxt.isoformat()} "
+                  f"({'this week already bought' if done else 'pending this week'})")
+        else:
+            print(f"  next buy : next open market session with new cash "
+                  f"(market open now: {is_market_open(now)})")
+
+        try:
+            self.client.ensure_session()
+            hold = self.client.holdings()
+            print(f"\n  holdings ({len(hold)}):")
+            for h in hold:
+                print(f"    {h['symbol']:16s} qty={h['qty']:<8g} ltp={h['ltp']:>9.2f} "
+                      f"value=Rs{h['value']:>10,.2f}")
+            print(f"    {'CASH':16s} {'':8} {'':9}  value=Rs{self.client.funds():>10,.2f}")
+        except Exception as e:
+            print(f"\n  holdings : unavailable ({type(e).__name__}: {e})")
+
+        rows = self.db.c.execute(
+            "select run_date, symbol, side, qty, ltp, amount, dry, status, reason "
+            "from orders order by ts desc limit 10").fetchall()
+        print(f"\n  recent orders ({len(rows)}):")
+        if not rows:
+            print("    (none)")
+        for d, sym, side, qty, ltp, amt, dry, st, reason in rows:
+            print(f"    {d}  {side:4s} {qty:>6g} {sym:14s} @{ltp:>9.2f}  Rs{amt:>9,.2f}  "
+                  f"{'DRY' if dry else 'LIVE'}/{st:<10s} {reason}")
 
 
 def _ts(symbol):
@@ -463,6 +529,38 @@ def _rca_2025(nb, buys, cost):
 
 # --- self-test (no network) ----------------------------------------------
 
+def print_payloads():
+    """Exact JSON shapes POSTed to N8N_WEBHOOK_URL. Switch your n8n node on `event`.
+    Every payload carries the same base keys; `event` decides the extras."""
+    base = {"ts": "2026-09-14T10:00:03.412000+05:30", "date": "2026-09-14",
+            "mode": "schedule", "dry_run": True, "equity": 8123.45, "cash": 3500.0,
+            "life": 1.0154, "paused": False}
+    samples = {
+        "buy": {**base, "event": "buy", "net_deployed": 486.09,
+                "orders": [{"symbol": "NIFTYBEES", "side": "BUY", "qty": 1,
+                            "ltp": 486.09, "amount": 486.09, "status": "DRY"}]},
+        "no_cash": {**base, "cash": 120.0, "event": "no_cash",
+                    "note": "insufficient cash for scheduled buy",
+                    "required": 500.0, "deployable": 120.0},
+        "paused": {**base, "equity": 4100.0, "life": 0.5125, "paused": True,
+                   "event": "paused", "note": "life 51.2% below floor 60%"},
+        "error": {"ts": "2026-09-14T11:00:01.882000+05:30", "date": "2026-09-14",
+                  "mode": "schedule", "dry_run": True, "event": "error",
+                  "error": "ConnectionError: HTTPSConnectionPool(host='apiconnect.angelone.in')",
+                  "traceback": "Traceback (most recent call last):\n  ...last 800 chars..."},
+    }
+    print("POST " + "$N8N_WEBHOOK_URL" + "   Content-Type: application/json\n")
+    print("Base keys on every event: ts, date, mode, dry_run, event"
+          "  (+ equity, cash, life, paused on all but `error`)\n")
+    for name, body in samples.items():
+        print(f"--- event = \"{name}\" " + "-" * (58 - len(name)))
+        print(json.dumps(body, indent=2))
+        print()
+    print("n8n: Switch node on {{ $json.event }} -> buy | no_cash | paused | error")
+    print("Note: `status` inside orders[] is \"DRY\" while DRY_RUN/--paper-live is on,")
+    print("      \"PLACED\" once live, or \"ERROR:<msg>\" if the broker rejected it.")
+
+
 def _selftest():
     # Monday 2025-08-15 is a holiday (Independence Day) -> buy rolls to next trading day
     assert not is_trading_day(date(2025, 8, 15))                 # holiday (Fri)
@@ -504,6 +602,10 @@ def main():
     ap.add_argument("--paper-live", action="store_true",
                     help="soak test: real schedule + live prices in real time, logs orders, "
                          "places nothing (forces DRY_RUN, meant to run for days/weeks)")
+    ap.add_argument("--status", action="store_true",
+                    help="holdings, last/next run, life meter, recent orders (no log reading)")
+    ap.add_argument("--print-payloads", action="store_true",
+                    help="print the exact webhook JSON shapes for building the n8n node")
     ap.add_argument("--backtest", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -511,6 +613,12 @@ def main():
 
     if args.selftest:
         _selftest()
+        return
+    if args.print_payloads:
+        print_payloads()
+        return
+    if args.status:
+        DcaAgent(DcaConfig()).status()
         return
     if args.backtest:
         backtest()
