@@ -572,6 +572,48 @@ def _rca_2025(nb, buys, cost):
 
 # --- self-test (no network) ----------------------------------------------
 
+def serve(agent, port=8080):
+    """Read-only, phone-friendly --status page. Publish it on 127.0.0.1 only and reach it from
+    a phone over Tailscale -- it shows holdings, so never expose it on the open LAN."""
+    import contextlib
+    import html
+    import io
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in ("/", "/status"):
+                self.send_error(404)
+                return
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    agent.status()
+            except Exception as e:
+                buf.write(f"\nstatus failed: {type(e).__name__}: {e}")
+            body = (
+                "<!doctype html><meta charset=utf-8>"
+                "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                "<meta http-equiv=refresh content=60><title>DCA agent</title>"
+                "<style>:root{color-scheme:light dark}body{margin:0;background:#fafafa;color:#111;"
+                "font:11px/1.5 ui-monospace,Menlo,monospace}pre{margin:0;padding:14px;"
+                "white-space:pre-wrap;overflow-wrap:anywhere}@media(prefers-color-scheme:dark){"
+                "body{background:#111;color:#e8e8e8}}</style>"
+                f"<pre>{html.escape(buf.getvalue())}</pre>").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    agent.log(f"status page on :{port} (refreshes every 60s)")
+    # single-threaded on purpose: the sqlite connection belongs to this thread
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
 def print_payloads():
     """Exact JSON shapes POSTed to N8N_WEBHOOK_URL. Switch your n8n node on `event`.
     Every payload carries the same base keys; `event` decides the extras."""
@@ -660,6 +702,8 @@ def main():
                          "places nothing (forces DRY_RUN, meant to run for days/weeks)")
     ap.add_argument("--status", action="store_true",
                     help="holdings, last/next run, life meter, recent orders (no log reading)")
+    ap.add_argument("--serve", action="store_true",
+                    help="read-only status web page on :8080 (for checking from a phone)")
     ap.add_argument("--print-payloads", action="store_true",
                     help="print the exact webhook JSON shapes for building the n8n node")
     ap.add_argument("--backtest", action="store_true")
@@ -675,6 +719,9 @@ def main():
         return
     if args.status:
         DcaAgent(DcaConfig()).status()
+        return
+    if args.serve:
+        serve(DcaAgent(DcaConfig()))
         return
     if args.backtest:
         backtest()

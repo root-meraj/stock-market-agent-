@@ -235,6 +235,26 @@ docker compose down                # stop (state is kept in volumes)
   uses explicit IST either way.
 - Logs rotate at 3 × 10 MB.
 
+**Checking from your iPhone**
+
+`docker compose up -d` also starts `dca-status`, a read-only page with the same content as
+`--status` that refreshes every 60 s. It's published on `127.0.0.1:8080` only, so nobody on
+your Wi-Fi can see your holdings. To reach it from the phone, anywhere, use Tailscale (free,
+private, no router changes):
+
+1. Install Tailscale on the laptop and the iPhone (App Store), signed in to the same account.
+2. On the laptop, in PowerShell: `tailscale serve --bg 8080`. It prints an address like
+   `https://your-laptop.tailXXXX.ts.net/`.
+3. Open that on the iPhone, then Share → **Add to Home Screen**.
+
+It only answers while the laptop is awake and connected.
+
+**Push alerts to the phone:** n8n is already running locally. Build a workflow with a
+**Webhook** node (POST, path `dca`) → **Telegram** node, activate it, and add to `.env`:
+`N8N_WEBHOOK_URL=http://host.docker.internal:5678/webhook/dca`. Use `host.docker.internal`,
+not `localhost`, because inside the container `localhost` is the container itself. Then
+run `docker compose up -d`.
+
 **Laptop sleep/off:** the container pauses with the machine. When it wakes, the hourly loop
 resumes and catch-up buys this week's missed day if the market is open.
 
