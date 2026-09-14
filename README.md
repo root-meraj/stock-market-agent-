@@ -249,7 +249,8 @@ private, no router changes):
 
 It only answers while the laptop is awake and connected.
 
-**Push alerts to the phone:** n8n is already running locally. Build a workflow with a
+**Push alerts to the phone (optional, needs n8n):** alerts are off unless you set
+`N8N_WEBHOOK_URL`; the agent runs fine without them. If you run n8n, build a workflow with a
 **Webhook** node (POST, path `dca`) → **Telegram** node, activate it, and add to `.env`:
 `N8N_WEBHOOK_URL=http://host.docker.internal:5678/webhook/dca`. Use `host.docker.internal`,
 not `localhost`, because inside the container `localhost` is the container itself. Then
