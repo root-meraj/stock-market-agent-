@@ -115,6 +115,17 @@ def is_market_open(now, holidays=NSE_HOLIDAYS):
     return is_trading_day(now.date(), holidays) and _t(9, 15) <= now.time() <= _t(15, 30)
 
 
+def next_market_open(now, holidays=NSE_HOLIDAYS):
+    """When the NSE cash session next opens (`now` itself if it's open right now)."""
+    from datetime import time as _t
+    if is_market_open(now, holidays):
+        return now
+    d = now.date()
+    if not (is_trading_day(d, holidays) and now.time() < _t(9, 15)):
+        d = next_trading_day(d + timedelta(days=1), holidays)
+    return datetime.combine(d, _t(9, 15), tzinfo=IST)
+
+
 # --- the agent ------------------------------------------------------------
 
 class DcaAgent:
@@ -302,65 +313,87 @@ class DcaAgent:
             time.sleep(self.cfg.poll_seconds)
 
     # --- operator view: everything without reading logs ---
-    def status(self):
-        cfg = self.cfg
-        now = datetime.now(IST)
-        print(f"DCA agent status @ {now:%Y-%m-%d %H:%M:%S} IST")
-        print(f"  mode={cfg.deploy_mode}  instrument={cfg.instrument or cfg.basket}  "
-              f"amount=Rs{cfg.amount:.0f}  dry_run={cfg.dry_run}  db={cfg.db_path}")
-        if cfg.dry_run and cfg.paper_cash:
-            print(f"  PAPER_CASH=Rs{float(cfg.paper_cash):,.0f} -> cash below is SIMULATED, not your account")
+    def status_data(self):
+        """One snapshot of everything an operator wants; rendered as text (--status) or HTML (--serve)."""
+        cfg, now = self.cfg, datetime.now(IST)
+        d = {"now": now, "mode": cfg.deploy_mode, "amount": cfg.amount, "dry_run": cfg.dry_run,
+             "instrument": cfg.instrument if not cfg.basket else ", ".join(cfg.basket),
+             "db": cfg.db_path, "start": cfg.starting_capital, "weekday": cfg.cadence_weekday,
+             "pause_life": cfg.pause_life, "resume_life": cfg.resume_life,
+             "paper_cash": float(cfg.paper_cash) if cfg.dry_run and cfg.paper_cash else None,
+             "market_open": is_market_open(now), "next_open": next_market_open(now),
+             "stale_after_min": 2 * cfg.poll_seconds / 60 + 10}
 
         row = self.db.c.execute(
             "select ts, equity, cash, life, paused from equity order by ts desc limit 1").fetchone()
+        d["last"] = None
         if row:
             ts, eq, cash, life, paused = row
-            age = (time.time() - ts) / 60
-            print(f"\n  last run : {datetime.fromtimestamp(ts, IST):%Y-%m-%d %H:%M:%S} IST "
-                  f"({age:.0f} min ago)")
-            print(f"  life     : {life:.1%} of Rs{cfg.starting_capital:.0f}  "
-                  f"[pause<={cfg.pause_life:.0%} resume>={cfg.resume_life:.0%}]  "
-                  f"{'PAUSED' if paused else 'active'}")
-            print(f"  equity   : Rs{eq:,.2f}   cash: Rs{cash:,.2f}")
-        else:
-            print("\n  last run : never (no equity snapshots yet)")
+            d["last"] = {"at": datetime.fromtimestamp(ts, IST), "age_min": (time.time() - ts) / 60,
+                         "equity": eq, "cash": cash, "life": life, "paused": bool(paused)}
 
         if cfg.deploy_mode == "schedule":
             action, sched = schedule_decision(now.date(), cfg.cadence_weekday,
                                               self.db.get_flag("last_buy_week"))
             if action == "done":
-                nxt = scheduled_buy_date(now.date() + timedelta(days=7), cfg.cadence_weekday)
-                print(f"  next buy : {nxt.isoformat()} (this week already bought)")
+                d["next"] = ("done", scheduled_buy_date(now.date() + timedelta(days=7),
+                                                        cfg.cadence_weekday))
             elif action == "wait":
-                print(f"  next buy : {sched.isoformat()} (scheduled)")
+                d["next"] = ("wait", sched)
             else:
-                note = f"CATCH-UP, {sched.isoformat()} was missed" if now.date() > sched else "due today"
-                print(f"  next buy : next market session ({note}; market open now: "
-                      f"{is_market_open(now)})")
+                d["next"] = ("catchup" if now.date() > sched else "due", sched)
         else:
-            print(f"  next buy : next open market session with new cash "
-                  f"(market open now: {is_market_open(now)})")
+            d["next"] = ("lump", None)
 
+        d["holdings"], d["real_cash"], d["holdings_error"] = [], None, None
         try:
             self.client.ensure_session()
-            hold = self.client.holdings()
-            print(f"\n  holdings ({len(hold)}):")
-            for h in hold:
+            d["holdings"] = self.client.holdings()
+            d["real_cash"] = self.client.funds()
+        except Exception as e:
+            d["holdings_error"] = f"{type(e).__name__}: {e}"
+
+        cols = ("date", "symbol", "side", "qty", "ltp", "amount", "dry", "status", "reason")
+        d["orders"] = [dict(zip(cols, r)) for r in self.db.c.execute(
+            "select run_date, symbol, side, qty, ltp, amount, dry, status, reason "
+            "from orders order by ts desc limit 10").fetchall()]
+        return d
+
+    def status(self):
+        d = self.status_data()
+        print(f"DCA agent status @ {d['now']:%Y-%m-%d %H:%M:%S} IST")
+        print(f"  mode={d['mode']}  instrument={d['instrument']}  amount=Rs{d['amount']:.0f}  "
+              f"dry_run={d['dry_run']}  db={d['db']}")
+        if d["paper_cash"] is not None:
+            print(f"  PAPER_CASH=Rs{d['paper_cash']:,.0f} -> cash below is SIMULATED, not your account")
+        last = d["last"]
+        if last:
+            print(f"\n  last run : {last['at']:%Y-%m-%d %H:%M:%S} IST ({last['age_min']:.0f} min ago)")
+            print(f"  life     : {last['life']:.1%} of Rs{d['start']:.0f}  [pause<={d['pause_life']:.0%} "
+                  f"resume>={d['resume_life']:.0%}]  {'PAUSED' if last['paused'] else 'active'}")
+            print(f"  equity   : Rs{last['equity']:,.2f}   cash: Rs{last['cash']:,.2f}")
+        else:
+            print("\n  last run : never (no equity snapshots yet)")
+        kind, when = d["next"]
+        text = {"done": f"{when} (this week already bought)", "wait": f"{when} (scheduled)",
+                "due": "next market session (due today)",
+                "catchup": f"next market session (CATCH-UP, {when} was missed)",
+                "lump": "next open market session with new cash"}[kind]
+        print(f"  next buy : {text}; market open now: {d['market_open']}")
+        if d["holdings_error"]:
+            print(f"\n  holdings : unavailable ({d['holdings_error']})")
+        else:
+            print(f"\n  holdings ({len(d['holdings'])}):")
+            for h in d["holdings"]:
                 print(f"    {h['symbol']:16s} qty={h['qty']:<8g} ltp={h['ltp']:>9.2f} "
                       f"value=Rs{h['value']:>10,.2f}")
-            print(f"    {'CASH':16s} {'':8} {'':9}  value=Rs{self.client.funds():>10,.2f}")
-        except Exception as e:
-            print(f"\n  holdings : unavailable ({type(e).__name__}: {e})")
-
-        rows = self.db.c.execute(
-            "select run_date, symbol, side, qty, ltp, amount, dry, status, reason "
-            "from orders order by ts desc limit 10").fetchall()
-        print(f"\n  recent orders ({len(rows)}):")
-        if not rows:
+            print(f"    {'CASH':16s} {'':8} {'':9}  value=Rs{d['real_cash']:>10,.2f}")
+        print(f"\n  recent orders ({len(d['orders'])}):")
+        if not d["orders"]:
             print("    (none)")
-        for d, sym, side, qty, ltp, amt, dry, st, reason in rows:
-            print(f"    {d}  {side:4s} {qty:>6g} {sym:14s} @{ltp:>9.2f}  Rs{amt:>9,.2f}  "
-                  f"{'DRY' if dry else 'LIVE'}/{st:<10s} {reason}")
+        for o in d["orders"]:
+            print(f"    {o['date']}  {o['side']:4s} {o['qty']:>6g} {o['symbol']:14s} @{o['ltp']:>9.2f}  "
+                  f"Rs{o['amount']:>9,.2f}  {'DRY' if o['dry'] else 'LIVE'}/{o['status']:<10s} {o['reason']}")
 
 
 def _ts(symbol):
@@ -572,12 +605,177 @@ def _rca_2025(nb, buys, cost):
 
 # --- self-test (no network) ----------------------------------------------
 
-def serve(agent, port=8080):
-    """Read-only, phone-friendly --status page. Publish it on 127.0.0.1 only and reach it from
-    a phone over Tailscale -- it shows holdings, so never expose it on the open LAN."""
-    import contextlib
+def _inr(x, dec=2):
+    """Indian digit grouping: 123456.7 -> Rs 1,23,456.70."""
+    whole, _, frac = f"{abs(x):.{dec}f}".partition(".")
+    head, tail = whole[:-3], whole[-3:]
+    groups = []
+    while len(head) > 2:
+        groups.insert(0, head[-2:])
+        head = head[:-2]
+    whole = ",".join(([head] if head else []) + groups + [tail])
+    return ("-" if x < 0 else "") + "₹" + whole + (f".{frac}" if frac else "")
+
+
+def _clock(t):
+    return t.strftime("%I:%M %p").lstrip("0")
+
+
+def _ago(minutes):
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes:.0f} min ago"
+    if minutes < 48 * 60:
+        return f"{minutes / 60:.0f} h ago"
+    return f"{minutes / 1440:.0f} days ago"
+
+
+PAGE_CSS = """
+:root{--bg:#f4f5f7;--card:#fff;--ink:#14161a;--muted:#6b7280;--line:#e5e7eb;--track:#eceef1;
+--ok:#15803d;--ok-bg:#dcfce7;--warn:#b45309;--warn-bg:#fef3c7;--bad:#b91c1c;--bad-bg:#fee2e2;
+--accent:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0c0f;--card:#16181d;--ink:#eef0f3;--muted:#9aa1ad;
+--line:#262a31;--track:#23272e;--ok:#4ade80;--ok-bg:#12351f;--warn:#fbbf24;--warn-bg:#3a2c0b;
+--bad:#f87171;--bad-bg:#3b1414;--accent:#60a5fa}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 -apple-system,BlinkMacSystemFont,
+"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:520px;margin:0 auto;padding:18px 16px 32px}
+header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:4px 2px 16px}
+h1{font-size:24px;margin:0;letter-spacing:-.02em}
+.sub{color:var(--muted);font-size:14px;margin-top:2px}
+.pill{font-size:13px;font-weight:600;padding:5px 11px;border-radius:999px;white-space:nowrap}
+.ok{color:var(--ok);background:var(--ok-bg)}.warn{color:var(--warn);background:var(--warn-bg)}
+.bad{color:var(--bad);background:var(--bad-bg)}
+.banner{border-radius:12px;padding:10px 14px;font-size:14px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:12px}
+.label{color:var(--muted);font-size:13px;font-weight:500;text-transform:uppercase;letter-spacing:.04em}
+.big{font-size:32px;font-weight:700;letter-spacing:-.02em;margin:4px 0 2px;font-variant-numeric:tabular-nums}
+.mid{font-size:20px;font-weight:650;margin:4px 0 2px}
+.muted{color:var(--muted);font-size:14px}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:10px 0;
+border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.meta{color:var(--muted);font-size:13px;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.meter{height:8px;background:var(--track);border-radius:99px;overflow:hidden;margin:12px 0 6px;position:relative}
+.meter span{display:block;height:100%;border-radius:99px}
+.tag{font-size:12px;font-weight:600;padding:2px 8px;border-radius:6px;margin-left:6px}
+.empty{color:var(--muted);font-size:14px;padding:6px 0 2px}
+footer{color:var(--muted);font-size:13px;text-align:center;margin-top:18px}
+"""
+
+
+def render_page(d):
+    """Phone dashboard for status_data(). Everything dynamic is escaped."""
     import html
-    import io
+
+    e = html.escape
+    now, last = d["now"], d["last"]
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    if not last:
+        pill = ("warn", "No runs yet")
+    elif last["age_min"] > d["stale_after_min"]:
+        pill = ("bad", "Not checking in")
+    elif last["paused"]:
+        pill = ("bad", "Paused")
+    else:
+        pill = ("ok", "Active")
+    cadence = (f"{_inr(d['amount'], 0)} every {days[d['weekday']]}" if d["mode"] == "schedule"
+               else "buys whenever new cash arrives")
+    parts = [f"<header><div><h1>DCA agent</h1><div class=sub>{e(d['instrument'])} · {cadence}"
+             f"</div></div><span class='pill {pill[0]}'>{pill[1]}</span></header>"]
+
+    if last and last["age_min"] > d["stale_after_min"]:
+        parts.append(f"<div class='banner bad'>Last check was {_ago(last['age_min'])}. "
+                     "Is the laptop awake and Docker Desktop running?</div>")
+    if d["dry_run"]:
+        sim = (f" Cash is simulated ({_inr(d['paper_cash'], 0)})." if d["paper_cash"] is not None else "")
+        parts.append(f"<div class='banner warn'><b>Paper mode</b> — nothing is really bought.{sim}</div>")
+
+    # portfolio + life meter
+    if last:
+        life = last["life"]
+        tone = "ok" if life >= d["resume_life"] else ("warn" if life > d["pause_life"] else "bad")
+        cash_note = " (simulated)" if d["paper_cash"] is not None else ""
+        parts.append(
+            f"<section class=card><div class=label>Portfolio value</div>"
+            f"<div class=big>{_inr(last['equity'])}</div>"
+            f"<div class=muted>Cash {_inr(last['cash'])}{cash_note}</div>"
+            f"<div class=meter><span style='width:{min(life, 1) * 100:.0f}%;background:var(--{tone})'>"
+            f"</span></div><div class=muted>{life:.0%} of the {_inr(d['start'], 0)} starting amount · "
+            f"buying pauses below {d['pause_life']:.0%}</div></section>")
+
+    # next buy + market
+    kind, when = d["next"]
+    nxt_open = d["next_open"]
+    if kind == "lump":
+        headline, detail = "When new cash arrives", "Checked every hour while the market is open."
+    elif kind in ("due", "catchup"):
+        # say when it will actually buy, not just "today" -- at 11 PM that's tomorrow morning
+        if d["market_open"]:
+            headline = "Now"
+        elif nxt_open.date() == now.date():
+            headline = f"Today, {_clock(nxt_open)}"
+        else:
+            headline = f"{nxt_open:%a %d %b}, {_clock(nxt_open)}"
+        missed = kind == "catchup" or nxt_open.date() != now.date()
+        detail = (f"{when:%A}'s buy didn't happen in market hours, so it catches up then."
+                  if missed else "Buys at the first check once the market opens.")
+    else:
+        headline = f"{when:%a %d %b}"
+        detail = "This week's buy is done." if kind == "done" else "Scheduled."
+    market = ("Market open now" if d["market_open"] else
+              f"Market closed · opens {nxt_open:%a} {_clock(nxt_open)}")
+    checked = (f"Last check {_ago(last['age_min'])} ({_clock(last['at'])})" if last else "No checks yet")
+    parts.append(
+        f"<section class=card><div class=label>Next buy</div><div class=mid>{headline}</div>"
+        f"<div class=muted>{detail}</div><div class=meta>{market}<br>{checked}</div></section>")
+
+    # real account
+    rows = []
+    if d["holdings_error"]:
+        rows.append(f"<div class=empty>Couldn't reach Angel One: {e(d['holdings_error'])}</div>")
+    else:
+        for h in sorted(d["holdings"], key=lambda h: -h["value"]):
+            name = e(h["symbol"].removesuffix("-EQ"))
+            rows.append(f"<div class=row><div><div>{name}</div><div class=muted>{h['qty']:g} × "
+                        f"{_inr(h['ltp'])}</div></div><div class=num>{_inr(h['value'])}</div></div>")
+        rows.append(f"<div class=row><div>Cash</div><div class=num>{_inr(d['real_cash'] or 0)}</div></div>")
+    parts.append("<section class=card><div class=label>Your Angel One account (real)</div>"
+                 + "".join(rows) + "</section>")
+
+    # orders
+    rows = []
+    for o in d["orders"]:
+        st = o["status"] or ""
+        badge = (("warn", "Paper") if o["dry"] else ("ok", "Live")) if not st.startswith("ERROR") \
+            else ("bad", "Failed")
+        catch = "<span class='tag ok'>catch-up</span>" if "catchup" in (o["reason"] or "") else ""
+        day = datetime.strptime(o["date"], "%Y-%m-%d").strftime("%a %d %b")
+        rows.append(f"<div class=row><div><div>{e(o['side'].title())} {o['qty']:g} "
+                    f"{e(o['symbol'])}<span class='tag {badge[0]}'>{badge[1]}</span>{catch}</div>"
+                    f"<div class=muted>{day} · at {_inr(o['ltp'])}</div></div>"
+                    f"<div class=num>{_inr(o['amount'])}</div></div>")
+    if not rows:
+        rows.append("<div class=empty>No orders yet. The first buy will show up here.</div>")
+    parts.append("<section class=card><div class=label>Recent orders</div>" + "".join(rows) + "</section>")
+
+    parts.append(f"<footer>Updated {_clock(now)} · refreshes every minute</footer>")
+    return ("<!doctype html><html lang=en><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+            "<meta name=color-scheme content='light dark'><meta http-equiv=refresh content=60>"
+            "<meta name=apple-mobile-web-app-capable content=yes>"
+            "<meta name=apple-mobile-web-app-title content='DCA agent'>"
+            f"<title>DCA agent</title><style>{PAGE_CSS}</style><main>{''.join(parts)}</main></html>")
+
+
+def serve(agent, port=8080):
+    """Read-only phone dashboard of --status. Publish it on 127.0.0.1 only and reach it from
+    a phone over Tailscale -- it shows holdings, so never expose it on the open LAN."""
+    import html
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -585,21 +783,12 @@ def serve(agent, port=8080):
             if self.path not in ("/", "/status"):
                 self.send_error(404)
                 return
-            buf = io.StringIO()
             try:
-                with contextlib.redirect_stdout(buf):
-                    agent.status()
+                body = render_page(agent.status_data()).encode()
             except Exception as e:
-                buf.write(f"\nstatus failed: {type(e).__name__}: {e}")
-            body = (
-                "<!doctype html><meta charset=utf-8>"
-                "<meta name=viewport content='width=device-width,initial-scale=1'>"
-                "<meta http-equiv=refresh content=60><title>DCA agent</title>"
-                "<style>:root{color-scheme:light dark}body{margin:0;background:#fafafa;color:#111;"
-                "font:11px/1.5 ui-monospace,Menlo,monospace}pre{margin:0;padding:14px;"
-                "white-space:pre-wrap;overflow-wrap:anywhere}@media(prefers-color-scheme:dark){"
-                "body{background:#111;color:#e8e8e8}}</style>"
-                f"<pre>{html.escape(buf.getvalue())}</pre>").encode()
+                body = (f"<!doctype html><meta name=viewport content='width=device-width'>"
+                        f"<p style='font:16px system-ui;padding:20px'>Status page error: "
+                        f"{html.escape(f'{type(e).__name__}: {e}')}</p>").encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -691,7 +880,29 @@ def _selftest():
     live = DcaAgent(DcaConfig(db_path=":memory:", deploy_mode="lump", dry_run=False), client=_Fake())
     live.record_deployed(1000)                     # live: real cash moves, no sim offset
     assert live.effective_cash(1000) == 1000
-    print("selftest ok: calendar + RCA + XIRR + lump cash-detection behave")
+
+    # dashboard: Indian grouping, next open, and every render branch without a broker
+    assert _inr(123456.7) == "₹1,23,456.70" and _inr(500, 0) == "₹500" and _inr(0.62) == "₹0.62"
+    mon_night = datetime(2026, 9, 14, 23, 0, tzinfo=IST)
+    assert next_market_open(mon_night) == datetime(2026, 9, 15, 9, 15, tzinfo=IST)
+    base = {"now": mon_night, "mode": "schedule", "amount": 500, "dry_run": True,
+            "instrument": "NIFTYBEES", "db": ":memory:", "start": 8000, "weekday": 0,
+            "pause_life": 0.6, "resume_life": 0.7, "paper_cash": 8000.0, "market_open": False,
+            "next_open": next_market_open(mon_night), "stale_after_min": 130,
+            "last": {"at": mon_night, "age_min": 5, "equity": 9334.67, "cash": 8000,
+                     "life": 1.17, "paused": False},
+            "holdings": [{"symbol": "<b>X-EQ", "qty": 5, "ltp": 14.97, "value": 74.85}],
+            "real_cash": 0.62, "holdings_error": None,
+            "orders": [{"date": "2026-09-15", "symbol": "NIFTYBEES", "side": "BUY", "qty": 1,
+                        "ltp": 267.14, "amount": 267.14, "dry": 1, "status": "DRY",
+                        "reason": "dca-catchup"}]}
+    for kind, when in (("due", mon), ("catchup", mon), ("wait", mon), ("done", mon), ("lump", None)):
+        page = render_page({**base, "next": (kind, when)})
+        assert "<b>X" not in page and "&lt;b&gt;X" in page         # broker strings are escaped
+    assert "Not checking in" in render_page({**base, "next": ("due", mon),
+                                             "last": {**base["last"], "age_min": 500}})
+    assert "No runs yet" in render_page({**base, "next": ("due", mon), "last": None})
+    print("selftest ok: calendar + RCA + XIRR + lump cash-detection + dashboard behave")
 
 
 def main():
