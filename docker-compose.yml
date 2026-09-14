@@ -1,0 +1,24 @@
+services:
+  dca:
+    build: .
+    container_name: dca-agent
+    # Comes back after crashes, Docker restarts and reboots (if Docker Desktop starts on login).
+    # Days the laptop was off are covered by the agent's catch-up logic.
+    restart: unless-stopped
+    env_file: .env                     # ANGEL_* credentials, optional N8N_WEBHOOK_URL
+    environment:                       # soak config; these override .env
+      DCA_DB: /state/equity_dca.db
+      DEPLOY_MODE: schedule
+      DCA_START: "8000"
+      DCA_AMOUNT: "500"
+      PAPER_CASH: "8000"               # simulated cash for the unfunded paper soak; delete once funded
+    volumes:
+      - dca-state:/state               # SQLite: orders, snapshots, last-buy week
+      - dca-data:/app/data             # Angel scrip master cache (34MB, fetched once)
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  dca-state:
+  dca-data:

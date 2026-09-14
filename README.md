@@ -146,13 +146,27 @@ refresh `NSE_HOLIDAYS` for the year. Credentials live in `.env`
 Everything an operator needs without opening a log file:
 
 ```
-python equity_agent/dca_agent.py --status
+docker compose exec dca python equity_agent/dca_agent.py --status   # container running
+python equity_agent/dca_agent.py --status                           # plain local run
 ```
 
 Prints config, **last run** (+ minutes ago), **life-meter state** vs the pause/resume
-floors, equity/cash, **next scheduled buy**, **live holdings** (best-effort; degrades
-gracefully if the broker session fails), and the **last 10 orders** from SQLite with
-their DRY/LIVE status.
+floors, equity/cash, **next scheduled buy** (including `CATCH-UP` when this week's day was
+missed), **live holdings** (best-effort; degrades gracefully if the broker session fails),
+and the **last 10 orders** from SQLite with their DRY/LIVE status. The container and a
+plain local run use **different databases** (Docker volume vs `equity_dca.db` in the repo),
+so check the one that's actually running.
+
+## Catch-up (missed days are harmless)
+
+In `schedule` mode the agent asks SQLite "did this ISO week's buy already happen?" on
+every cycle, not "is today Monday?". So:
+
+- Monday missed (laptop off / Docker stopped), now Tuesday during market hours → **buys**,
+  logged as `dca-catchup`, webhook `"catchup": true`.
+- Already bought this week → does nothing, no matter how often it runs.
+- A whole week missed → that week is **skipped**, never doubled up next week.
+- Monday is an NSE holiday → the scheduled day itself moves to Tuesday.
 
 ## Webhook payloads (`N8N_WEBHOOK_URL`)
 
@@ -162,7 +176,7 @@ carries `ts, date, mode, dry_run, event` (plus `equity, cash, life, paused` on a
 
 | `event` | when | event-specific keys |
 |---------|------|---------------------|
-| `buy` | orders were planned (and placed, if live) | `orders[]`, `net_deployed` |
+| `buy` | orders were planned (and placed, if live) | `orders[]`, `net_deployed`, `catchup` |
 | `no_cash` | nothing deployable: no new cash (lump), insufficient for the scheduled buy, or below one tradeable unit | `note`, `deployable`, `required` (schedule only) |
 | `paused` | life meter below the floor — buying suspended | `note` |
 | `error` | a cycle raised; agent re-logs-in next cycle | `error`, `traceback` (last 800 chars) — **no** equity/cash/life |
@@ -170,80 +184,69 @@ carries `ts, date, mode, dry_run, event` (plus `equity, cash, life, paused` on a
 `orders[].status` is `"DRY"` under DRY_RUN/`--paper-live`, `"PLACED"` when live, or
 `"ERROR:<msg>"` if the broker rejected it.
 
-## Deploying to an Ubuntu VPS
+**Dedupe:** the loop runs hourly, so `paused` / `no_cash` / `error` are sent **at most once
+per day** each (tracked in SQLite). `buy` always sends.
 
-**Copy** (the repo minus junk — `data/`, `results/`, `logs/`, `*.db`, `.env` are gitignored):
+## Running locally with Docker (Windows)
 
-```bash
-rsync -av --exclude data --exclude results --exclude logs --exclude '*.db' \
-      --exclude .env --exclude __pycache__ ./ dca@VPS:/opt/crypto-agent/
+No server needed: it runs on your laptop, and your **home IP is the one Angel already
+accepts** (login + quotes verified from this machine). Docker only bundles the DCA agent —
+`db.py`, `risk.py`, `equity_agent/` and four pinned packages — not the research code.
+
+**Files:** `Dockerfile`, `docker-compose.yml`, `.dockerignore` (keeps `.env`, `data/`,
+`*.db` out of the image).
+
+**One-time setup**
+
+1. Install Docker Desktop and turn on **Settings → General → Start Docker Desktop when you
+   sign in**. Together with `restart: unless-stopped` that brings the agent back after a
+   reboot on its own.
+2. `.env` in the repo root holds the credentials (already there). Compose reads it as
+   `KEY=VALUE` — no `export`, no spaces around `=`. Add `N8N_WEBHOOK_URL=...` for alerts.
+3. Build and start:
+
+```powershell
+docker compose up -d --build
+docker compose logs -f dca                                           # watch it
+docker compose exec dca python equity_agent/dca_agent.py --status    # check on it
 ```
 
-**Install** on the server:
+**Everyday**
 
-```bash
-sudo adduser --system --group dca
-sudo mkdir -p /opt/crypto-agent /var/log/dca-agent
-sudo chown -R dca:dca /opt/crypto-agent /var/log/dca-agent
-sudo apt update && sudo apt install -y python3-venv
-sudo -u dca python3 -m venv /opt/crypto-agent/.venv
-sudo -u dca /opt/crypto-agent/.venv/bin/pip install -r /opt/crypto-agent/requirements.txt
+```powershell
+docker compose ps                  # is it up?
+docker compose restart dca         # after editing .env
+docker compose up -d --build       # after changing code
+docker compose down                # stop (state is kept in volumes)
 ```
 
-**Timezone** — the agent's calendar and market-hours gate are IST:
+**What the compose file sets**
 
-```bash
-sudo timedatectl set-timezone Asia/Kolkata && timedatectl
-```
+- Runs `--paper-live`: the persistent hourly loop, **forced DRY_RUN — it can't place an order.**
+- Soak config: `DEPLOY_MODE=schedule`, `DCA_AMOUNT=500`, `DCA_START=8000`.
+- `PAPER_CASH=8000`: the paper run pretends your account holds ₹8,000 cash. Without it the
+  unfunded account (≈₹1 cash) pauses the life meter at 17% and never reaches the buy path.
+  Holdings and prices are still real. `--status` labels simulated cash. **Delete this line
+  once the account is funded.**
+- State lives in named volumes: `dca-state` (SQLite) and `dca-data` (34 MB scrip master),
+  so rebuilds and restarts don't lose "already bought this week". `docker compose down -v`
+  wipes them.
+- `TZ=Asia/Kolkata` for readable logs. The agent's own calendar and market-hours logic
+  uses explicit IST either way.
+- Logs rotate at 3 × 10 MB.
 
-(The unit also sets `TZ=Asia/Kolkata`, so it is correct even if the host isn't.)
+**Laptop sleep/off:** the container pauses with the machine. When it wakes, the hourly loop
+resumes and catch-up buys this week's missed day if the market is open.
 
-**Recreate `.env`** on the server — never copy it over, retype it. systemd reads plain
-`KEY=VALUE`, so **no `export`, no quotes, no spaces around `=`**:
+**Git Bash gotcha:** `docker ... -e SOME_PATH=/tmp/x` gets `/tmp` rewritten to a Windows
+path. Use PowerShell, or prefix the command with `MSYS_NO_PATHCONV=1`.
 
-```bash
-sudo -u dca tee /opt/crypto-agent/.env >/dev/null <<'EOF'
-ANGEL_API_KEY=xxxxxxxx
-ANGEL_CLIENT_CODE=Axxxxxxx
-ANGEL_PIN=1234
-ANGEL_TOTP_SECRET=XXXXXXXXXXXXXXXX
-N8N_WEBHOOK_URL=https://your-n8n/webhook/dca
-EOF
-sudo chmod 600 /opt/crypto-agent/.env
-```
+**Before going live** (not needed for the paper soak): Angel requires a registered static
+IP for API order placement, and home broadband IPs usually change. Check your SmartAPI app
+settings before ever setting `DRY_RUN=false` on this machine.
 
-**Angel app static IP** — SmartAPI binds your API key to a whitelisted IP. Update it to
-the VPS's public IP or every login returns an auth error:
+### Soak status (checked 2026-09-14)
 
-```bash
-curl -s ifconfig.me     # the VPS public IP
-```
-
-Then in the Angel **SmartAPI dashboard** (smartapi.angelbroking.com → My Apps → edit your
-app) replace the static/whitelisted IP with that value and save. Re-verify with
-`python equity_agent/test_connection.py` on the server before enabling the service.
-
-**Service**:
-
-```bash
-sudo cp /opt/crypto-agent/deploy/dca-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now dca-agent          # start on boot + start now
-systemctl status dca-agent
-journalctl -u dca-agent -f                      # or tail /var/log/dca-agent/agent.log
-```
-
-`Restart=always`, `RestartSec=30`, `StartLimitIntervalSec=0` — it restarts on crash
-forever (no give-up threshold), and `After/Wants=network-online.target` avoids a failed
-first login on boot.
-
-### Soak prerequisites (checked 2026-09-10 — currently NOT met)
-
-A `--paper-live` soak only exercises the buy path if the account can actually buy:
-
-1. **Fund the account.** With equity ₹1,358 and `DCA_START=8000` the life meter reads
-   **17%**, below the 60% `pause_life` floor → the agent pauses and emits only `paused`
-   events. Either deposit so equity ≈ `DCA_START`, or lower `DCA_START` to match reality.
-2. **Leave settled cash ≥ `DCA_AMOUNT`.** Cash is currently ₹1; a scheduled ₹500 buy
-   would emit `no_cash` every week even unpaused.
-3. Set `N8N_WEBHOOK_URL`, or alerts are skipped (logged, not fatal).
+Verified inside the container: login ✓, live NIFTYBEES quote ✓, `PAPER_CASH` un-pauses the
+life meter (117%) ✓, DRY buy written to SQLite ✓, a second run the same week does nothing ✓.
+Still open: add `N8N_WEBHOOK_URL` if you want alerts (they're skipped and logged otherwise).

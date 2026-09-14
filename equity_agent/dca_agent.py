@@ -43,13 +43,18 @@ def _envbool(k, default):
     return os.environ.get(k, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env(k, default):
+    # read at construction, not import, so values that only live in .env (loaded in main) apply
+    return field(default_factory=lambda: os.environ.get(k, default))
+
+
 @dataclass
 class DcaConfig:
     dry_run: bool = field(default_factory=lambda: _envbool("DRY_RUN", True))
     # lump: deploy all available cash now, then buy only newly-detected cash (XIRR says cash
     # drag costs ~5%/yr, so this is the default). schedule: fixed weekly amount.
-    deploy_mode: str = os.environ.get("DEPLOY_MODE", "lump")
-    instrument: str = os.environ.get("DCA_INSTRUMENT", "NIFTYBEES")
+    deploy_mode: str = _env("DEPLOY_MODE", "lump")
+    instrument: str = _env("DCA_INSTRUMENT", "NIFTYBEES")
     basket: tuple = ()                      # e.g. ("RELIANCE","TCS","HDFCBANK"); overrides instrument
     amount: float = field(default_factory=lambda: float(os.environ.get("DCA_AMOUNT", 1000)))
     cadence_weekday: int = 0               # 0=Mon
@@ -58,8 +63,11 @@ class DcaConfig:
     pause_life: float = 0.6                # equity/start below -> pause buying
     resume_life: float = 0.7
     poll_seconds: int = 3600
-    db_path: str = os.path.join(ROOT, "equity_dca.db")
-    webhook: str = os.environ.get("N8N_WEBHOOK_URL", "")
+    db_path: str = _env("DCA_DB", os.path.join(ROOT, "equity_dca.db"))
+    webhook: str = _env("N8N_WEBHOOK_URL", "")
+    # Paper modes only: pretend the account holds this much cash so an unfunded soak still
+    # exercises the buy path against live prices. Ignored whenever dry_run is False.
+    paper_cash: str = _env("PAPER_CASH", "")
 
     @property
     def targets(self):
@@ -88,6 +96,19 @@ def scheduled_buy_date(today, weekday, holidays=NSE_HOLIDAYS):
     return next_trading_day(monday + timedelta(days=weekday), holidays)
 
 
+def schedule_decision(today, weekday, last_buy_week, holidays=NSE_HOLIDAYS):
+    """Catch-up aware: ('done', d) if this ISO week already bought, ('wait', d) before the
+    scheduled day, else ('buy', d) -- including days after a missed scheduled day, so a
+    laptop that was off on Monday still buys on Tuesday. Never buys twice in one week, and a
+    fully missed week is skipped rather than doubled up."""
+    buy_date = scheduled_buy_date(today, weekday, holidays)
+    if last_buy_week == today.strftime("%G-W%V"):
+        return "done", buy_date
+    if today < buy_date:
+        return "wait", buy_date
+    return "buy", buy_date
+
+
 def is_market_open(now, holidays=NSE_HOLIDAYS):
     """NSE cash session: trading day, 09:15-15:30 IST."""
     from datetime import time as _t
@@ -112,7 +133,8 @@ class DcaAgent:
 
     # portfolio snapshot from the live account (read-only; works in dry run too)
     def snapshot(self):
-        cash = self.client.funds()
+        paper = self.cfg.dry_run and self.cfg.paper_cash
+        cash = float(self.cfg.paper_cash) if paper else self.client.funds()
         holdings = {h["symbol"]: h for h in self.client.holdings()}
         held_value = sum(h["value"] for h in holdings.values())
         return cash + held_value, cash, holdings
@@ -197,6 +219,7 @@ class DcaAgent:
             self.log("market closed -> no action")
             return
 
+        catchup = False
         if self.cfg.deploy_mode == "lump":
             deploy = self.effective_cash(cash)
             if deploy < 1:
@@ -206,19 +229,25 @@ class DcaAgent:
                 return
             orders = self.plan_orders(deploy, holdings, equity, reason="lump")
         else:                                             # schedule: fixed weekly amount
-            buy_date = scheduled_buy_date(today, self.cfg.cadence_weekday)
-            if today != buy_date:
-                self.log(f"not a buy day (next scheduled buy {buy_date.isoformat()})")
-                return
-            if self.already_bought_this_week(today):
+            action, buy_date = schedule_decision(
+                today, self.cfg.cadence_weekday, self.db.get_flag("last_buy_week"))
+            if action == "done":
                 self.log("already bought this week")
                 return
-            if cash < self.cfg.amount:
-                self.log(f"insufficient cash (Rs{cash:.0f} < Rs{self.cfg.amount:.0f}) -> skip")
-                self.alert({**base, "event": "no_cash", "note": "insufficient cash for scheduled buy",
-                            "required": round(self.cfg.amount, 2), "deployable": round(cash, 2)})
+            if action == "wait":
+                self.log(f"not yet (scheduled buy {buy_date.isoformat()})")
                 return
-            orders = self.plan_orders(self.cfg.amount, holdings, equity, reason="dca")
+            catchup = today > buy_date
+            if catchup:
+                self.log(f"catch-up: scheduled buy {buy_date.isoformat()} was missed, buying now")
+            avail = self.effective_cash(cash)
+            if avail < self.cfg.amount:
+                self.log(f"insufficient cash (Rs{avail:.0f} < Rs{self.cfg.amount:.0f}) -> skip")
+                self.alert({**base, "event": "no_cash", "note": "insufficient cash for scheduled buy",
+                            "required": round(self.cfg.amount, 2), "deployable": round(avail, 2)})
+                return
+            orders = self.plan_orders(self.cfg.amount, holdings, equity,
+                                      reason="dca-catchup" if catchup else "dca")
 
         if not orders:
             self.log("nothing deployable this run")
@@ -227,22 +256,29 @@ class DcaAgent:
             return
         placed = [self.execute(order, today) for order in orders]
         net = sum(o[4] if o[1] == "BUY" else -o[4] for o in orders)  # net cash deployed
-        if self.cfg.deploy_mode == "lump":
-            self.record_deployed(net)
-        else:
+        self.record_deployed(net)                         # paper only: simulate cash leaving
+        if self.cfg.deploy_mode == "schedule":
             self.db.set_flag("last_buy_week", today.strftime("%G-W%V"))
-        self.alert({**base, "event": "buy", "orders": placed,
+        self.alert({**base, "event": "buy", "catchup": catchup, "orders": placed,
                     "net_deployed": round(net, 2)})
 
     def alert(self, payload):
         if not self.cfg.webhook:
             self.log("no N8N_WEBHOOK_URL set -> skipping alert")
             return
+        # buys always notify; paused/no_cash/error repeat every hourly cycle, so send once a day
+        event = payload.get("event")
+        key = f"alert_{event}"
+        if event != "buy" and self.db.get_flag(key) == payload.get("date"):
+            self.log(f"{event} alert already sent today -> suppressed")
+            return
         try:
             req = urllib.request.Request(
                 self.cfg.webhook, data=json.dumps(payload).encode(),
                 headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=10).read()
+            if event != "buy":
+                self.db.set_flag(key, payload.get("date"))
             self.log("alert sent")
         except Exception as e:
             self.log(f"alert failed: {e}")
@@ -272,6 +308,8 @@ class DcaAgent:
         print(f"DCA agent status @ {now:%Y-%m-%d %H:%M:%S} IST")
         print(f"  mode={cfg.deploy_mode}  instrument={cfg.instrument or cfg.basket}  "
               f"amount=Rs{cfg.amount:.0f}  dry_run={cfg.dry_run}  db={cfg.db_path}")
+        if cfg.dry_run and cfg.paper_cash:
+            print(f"  PAPER_CASH=Rs{float(cfg.paper_cash):,.0f} -> cash below is SIMULATED, not your account")
 
         row = self.db.c.execute(
             "select ts, equity, cash, life, paused from equity order by ts desc limit 1").fetchone()
@@ -288,12 +326,17 @@ class DcaAgent:
             print("\n  last run : never (no equity snapshots yet)")
 
         if cfg.deploy_mode == "schedule":
-            done = self.already_bought_this_week(now.date())
-            nxt = scheduled_buy_date(now.date(), cfg.cadence_weekday)
-            if done or nxt < now.date():
+            action, sched = schedule_decision(now.date(), cfg.cadence_weekday,
+                                              self.db.get_flag("last_buy_week"))
+            if action == "done":
                 nxt = scheduled_buy_date(now.date() + timedelta(days=7), cfg.cadence_weekday)
-            print(f"  next buy : {nxt.isoformat()} "
-                  f"({'this week already bought' if done else 'pending this week'})")
+                print(f"  next buy : {nxt.isoformat()} (this week already bought)")
+            elif action == "wait":
+                print(f"  next buy : {sched.isoformat()} (scheduled)")
+            else:
+                note = f"CATCH-UP, {sched.isoformat()} was missed" if now.date() > sched else "due today"
+                print(f"  next buy : next market session ({note}; market open now: "
+                      f"{is_market_open(now)})")
         else:
             print(f"  next buy : next open market session with new cash "
                   f"(market open now: {is_market_open(now)})")
@@ -536,7 +579,7 @@ def print_payloads():
             "mode": "schedule", "dry_run": True, "equity": 8123.45, "cash": 3500.0,
             "life": 1.0154, "paused": False}
     samples = {
-        "buy": {**base, "event": "buy", "net_deployed": 486.09,
+        "buy": {**base, "event": "buy", "catchup": False, "net_deployed": 486.09,
                 "orders": [{"symbol": "NIFTYBEES", "side": "BUY", "qty": 1,
                             "ltp": 486.09, "amount": 486.09, "status": "DRY"}]},
         "no_cash": {**base, "cash": 120.0, "event": "no_cash",
@@ -569,6 +612,19 @@ def _selftest():
     assert d == date(2025, 8, 18), d                             # rolls to Mon 18th (17th=Sun)
     # normal Monday is itself
     assert scheduled_buy_date(date(2025, 9, 8), weekday=0) == date(2025, 9, 8)
+
+    # catch-up: Mon 2026-09-14 scheduled; laptop off Monday -> Tuesday still buys, once
+    mon, tue, sun = date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 13)
+    wk = mon.strftime("%G-W%V")
+    assert schedule_decision(mon, 0, None) == ("buy", mon)             # on time
+    assert schedule_decision(tue, 0, "2026-W37") == ("buy", mon)       # missed Mon -> catch up
+    assert schedule_decision(tue, 0, wk) == ("done", mon)              # already bought -> nothing
+    # whole week missed: Sun still says "buy" for W37, but the market-open gate blocks it, so
+    # W37 is skipped and Monday buys W38 exactly once -- never doubled up
+    assert schedule_decision(sun, 0, None) == ("buy", date(2026, 9, 7))
+    assert not is_market_open(datetime(2026, 9, 13, 11, 0, tzinfo=IST))
+    assert schedule_decision(date(2026, 1, 26), 0, None) == ("wait", date(2026, 1, 27))  # Mon holiday
+    assert schedule_decision(date(2026, 1, 27), 0, None) == ("buy", date(2026, 1, 27))
     # DCA buys more units when price is low
     px_hi, px_lo = 100.0, 50.0
     import backtest as bt
