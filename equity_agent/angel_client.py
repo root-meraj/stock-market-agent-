@@ -11,12 +11,23 @@ import time
 import urllib.request
 from datetime import datetime, timedelta
 
+import logging
+
+import logzero
 import pyotp
 
 try:
     from SmartApi import SmartConnect
 except ImportError:                                   # older package layout
     from SmartApi.smartConnect import SmartConnect
+
+
+def _silence_smartapi_logs():
+    """SmartApi logs the full login request -- PIN, TOTP and API key -- on any HTTP error, to
+    stdout and to ./logs/<date>/app.log (re-enabled on every SmartConnect()). Turn both off;
+    our own code reports failures without the credentials."""
+    logzero.logfile(None)
+    logzero.loglevel(logging.CRITICAL + 1)
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,7 +109,8 @@ class AngelClient:
 
     # --- session (daily expiry; safe to call again) ---
     def login(self):
-        self.smart = SmartConnect(api_key=self.api_key)
+        self.smart = SmartConnect(api_key=self.api_key, timeout=20)   # lib default 7s drops on slow wifi
+        _silence_smartapi_logs()
         totp = pyotp.TOTP(self.totp_secret).now()
         resp = self.smart.generateSession(self.client_code, self.mpin, totp)
         if not resp.get("status"):

@@ -27,6 +27,7 @@ from db import DB
 from risk import RiskManager
 
 IST = timezone(timedelta(hours=5, minutes=30))
+RETRY_SECONDS = 300                         # after a failed cycle (network drop), not the full hour
 
 # NSE trading holidays (weekends handled separately). UPDATE YEARLY -- the real calendar
 # can't be derived; this is the calibration knob. Source: NSE holiday list.
@@ -298,19 +299,22 @@ class DcaAgent:
         self.log(f"DCA agent up. mode={self.cfg.deploy_mode} instrument={self.cfg.instrument} "
                  f"basket={self.cfg.basket} amount=Rs{self.cfg.amount:.0f} dry_run={self.cfg.dry_run}")
         while True:
+            wait = self.cfg.poll_seconds
             try:
                 self.run_once()
             except Exception as e:
                 import traceback
                 tb = traceback.format_exc()
-                self.log("cycle error (will re-login next cycle):\n" + tb)
+                # a wifi switch or slow network shouldn't cost a whole hour of market time
+                wait = RETRY_SECONDS
+                self.log(f"cycle error, retrying in {wait // 60} min: {type(e).__name__}: {e}")
                 self.client._login_date = None    # force fresh login next cycle (token/net drop)
                 self.alert({"ts": datetime.now(IST).isoformat(),
                             "date": datetime.now(IST).date().isoformat(),
                             "mode": self.cfg.deploy_mode, "dry_run": self.cfg.dry_run,
                             "event": "error", "error": f"{type(e).__name__}: {e}",
                             "traceback": tb[-800:]})
-            time.sleep(self.cfg.poll_seconds)
+            time.sleep(wait)
 
     # --- operator view: everything without reading logs ---
     def status_data(self):
